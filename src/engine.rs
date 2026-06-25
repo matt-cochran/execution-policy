@@ -354,8 +354,35 @@ where
         }
 
         // Backoff before the next attempt, capped by the total deadline.
-        let raw = plan.retry.delay(attempt_no, core);
+        let raw = plan.retry.delay(attempt_no, core, last_error.as_ref());
         last_delay = Some(raw);
+
+        // When a retry-after hint pushes the required delay past the remaining
+        // total_timeout budget, stop rather than overshoot.
+        if let Some(deadline) = total_deadline {
+            let remaining = deadline.saturating_duration_since(core.now());
+            // If the hint alone (before jitter reduction) would exceed the
+            // remaining budget, bail out now.
+            if let Some(ref err) = last_error {
+                if let Some(hint) = plan.retry.retry_after_hint(err) {
+                    if hint > remaining {
+                        emit(&plan.on_event, || Event::GaveUp {
+                            attempts: attempt_no,
+                        });
+                        return Err(ExecutionError::TotalTimeout {
+                            context: context(
+                                attempt_no,
+                                start,
+                                core.now(),
+                                last_delay,
+                                breaker_state,
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
         let delay = match total_deadline {
             Some(d) => raw.min(d.saturating_duration_since(core.now())),
             None => raw,
@@ -379,7 +406,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 mod tests {
     use super::*;
     use crate::core::{ManualClock, TestCore};
@@ -436,5 +463,142 @@ mod tests {
         assert!(e.is_exhausted());
         assert_eq!(e.context().attempts, 2);
         assert_eq!(e.into_inner(), Some("always"));
+    }
+
+    // ---- retry-after hint tests ----
+
+    /// A minimal error type that optionally carries a server-supplied retry-after
+    /// duration — mimics what a caller would extract from an HTTP or gRPC error.
+    #[derive(Debug, Clone)]
+    struct HintedError {
+        hint: Option<Duration>,
+    }
+
+    fn hinted_plan(
+        retry: Retry<u32, HintedError>,
+        total_to: Option<Duration>,
+    ) -> Plan<u32, HintedError> {
+        Plan {
+            retry,
+            attempt_timeout: None,
+            total_timeout: total_to,
+            breaker: None,
+            concurrency: None,
+            on_event: None,
+        }
+    }
+
+    /// The delay() method floors to the hint when it exceeds the raw backoff.
+    /// This is a pure unit test — no engine, no sleeping.
+    #[test]
+    fn delay_method_floors_to_hint() {
+        let core = TestCore::new(ManualClock::new());
+        let retry = Retry::<u32, HintedError>::fixed(Duration::from_millis(100))
+            .max_attempts(3)
+            .retry_after(|e: &HintedError| e.hint);
+
+        let err = HintedError {
+            hint: Some(Duration::from_secs(2)),
+        };
+        // Raw backoff is 100 ms; hint is 2 s → delay must be ≥ 2 s (before jitter).
+        let d = retry.delay(1, &core, Some(&err));
+        assert!(
+            d >= Duration::from_secs(2),
+            "delay {d:?} should be >= hint 2s"
+        );
+    }
+
+    /// When the hint is smaller than the raw backoff, the backoff wins.
+    #[test]
+    fn delay_method_keeps_backoff_when_larger_than_hint() {
+        let core = TestCore::new(ManualClock::new());
+        let retry = Retry::<u32, HintedError>::fixed(Duration::from_secs(5))
+            .max_attempts(3)
+            .retry_after(|e: &HintedError| e.hint);
+
+        let err = HintedError {
+            hint: Some(Duration::from_millis(100)), // hint < backoff
+        };
+        // Raw backoff is 5 s; hint is 100 ms → backoff wins.
+        let d = retry.delay(1, &core, Some(&err));
+        assert_eq!(d, Duration::from_secs(5));
+    }
+
+    /// When the hint exceeds the remaining total_timeout budget, the engine
+    /// stops (TotalTimeout) rather than sleeping past the deadline. The hint
+    /// check is synchronous, so no clock advancement is needed.
+    #[tokio::test]
+    async fn retry_after_hint_exceeding_budget_stops() {
+        let clock = ManualClock::new();
+        let core = TestCore::new(clock.clone());
+
+        let retry = Retry::<u32, HintedError>::fixed(Duration::from_millis(100))
+            .max_attempts(5)
+            .retry_after(|e: &HintedError| e.hint);
+
+        // total budget: 1 s; hint: 2 s → engine must stop, not sleep past deadline
+        let p = hinted_plan(retry, Some(Duration::from_secs(1)));
+
+        let result = run_pipeline(&core, &p, async |_a| {
+            Err::<u32, _>(HintedError {
+                hint: Some(Duration::from_secs(2)),
+            })
+        })
+        .await;
+
+        // The hint (2 s) exceeds remaining budget (1 s); engine returns TotalTimeout.
+        assert!(
+            result.unwrap_err().is_timeout(),
+            "expected TotalTimeout when hint exceeds remaining budget"
+        );
+    }
+
+    /// When no extractor is registered, behavior is identical to plain backoff
+    /// (zero delay in this case, so no clock advancement is needed).
+    #[tokio::test]
+    async fn no_extractor_ignores_hint_in_error() {
+        let core = TestCore::new(ManualClock::new());
+
+        // No .retry_after() — plain zero-delay fixed backoff.
+        let retry = Retry::<u32, HintedError>::fixed(Duration::ZERO).max_attempts(2);
+        let p = hinted_plan(retry, None);
+
+        let result = run_pipeline(&core, &p, async |a| {
+            if a.number() < 2 {
+                // Error carries a huge hint, but no extractor is set.
+                Err(HintedError {
+                    hint: Some(Duration::from_secs(999)),
+                })
+            } else {
+                Ok(1u32)
+            }
+        })
+        .await;
+
+        // No extractor → hint ignored, zero delay, succeeds normally.
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    /// When the extractor returns `None`, behavior is identical to plain backoff.
+    #[tokio::test]
+    async fn none_hint_falls_back_to_plain_backoff() {
+        let core = TestCore::new(ManualClock::new());
+
+        // Extractor present but always returns None → zero-delay plain backoff.
+        let retry = Retry::<u32, HintedError>::fixed(Duration::ZERO)
+            .max_attempts(2)
+            .retry_after(|e: &HintedError| e.hint);
+        let p = hinted_plan(retry, None);
+
+        let result = run_pipeline(&core, &p, async |a| {
+            if a.number() < 2 {
+                Err(HintedError { hint: None }) // extractor returns None
+            } else {
+                Ok(7u32)
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 7);
     }
 }

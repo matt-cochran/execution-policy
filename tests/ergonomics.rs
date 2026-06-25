@@ -1,3 +1,4 @@
+#![cfg(feature = "test-util")]
 //! Proves all four methods, state injection, `!Send` ops, and `?` interop.
 
 use std::rc::Rc;

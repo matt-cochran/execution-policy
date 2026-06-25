@@ -19,6 +19,10 @@ pub enum RetryDecision {
 pub(crate) type ErrorPredicate<E> = Box<dyn Fn(&E) -> bool + Send + Sync>;
 pub(crate) type OutcomeClassifier<T, E> = Box<dyn Fn(&Result<T, E>) -> RetryDecision + Send + Sync>;
 
+/// An optional closure that extracts an explicit retry-after delay hint from
+/// an error value. Used by [`crate::retry::Retry::retry_after`].
+pub type RetryAfterExtractor<E> = Box<dyn Fn(&E) -> Option<std::time::Duration> + Send + Sync>;
+
 /// How an outcome maps to a retry decision. `Result<T, E>` *is* the outcome —
 /// there is no separate `Outcome` type.
 pub(crate) enum Classifier<T, E> {

@@ -1,3 +1,4 @@
+#![cfg(feature = "test-util")]
 //! Integration: circuit breaker, bounded concurrency, and retry budget through
 //! the full `ExecutionPolicy` surface.
 

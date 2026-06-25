@@ -7,6 +7,8 @@
 //! operations are accepted.
 //!
 //! ```
+//! # #[cfg(feature = "tokio")]
+//! # {
 //! use std::time::Duration;
 //! use execution_policy::{ExecutionPolicyBuilder, Retry};
 //!
@@ -19,6 +21,7 @@
 //!
 //! let value = policy.run(async || Ok::<_, &str>(7u32)).await.unwrap();
 //! assert_eq!(value, 7);
+//! # }
 //! # }
 //! ```
 
