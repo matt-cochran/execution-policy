@@ -6,8 +6,13 @@ use std::time::Duration;
 use crate::breaker::BreakerRuntime;
 use crate::classify::ErrorPredicate;
 use crate::concurrency::CompiledConcurrency;
+use crate::error::ExecutionError;
 use crate::event::EventHook;
 use crate::retry::Retry;
+
+/// Async fallback invoked after a terminal failure.
+pub(crate) type FallbackFn<T, E> =
+    Box<dyn Fn(&ExecutionError<E>) -> crate::core::BoxFuture<'_, Result<T, E>> + Send + Sync>;
 
 /// A breaker compiled into live state plus its fault classifier.
 pub(crate) struct CompiledBreaker<E> {
@@ -31,6 +36,7 @@ pub(crate) struct Plan<T, E> {
     pub(crate) breaker: Option<CompiledBreaker<E>>,
     pub(crate) concurrency: Option<CompiledConcurrency>,
     pub(crate) on_event: Option<EventHook>,
+    pub(crate) fallback: Option<FallbackFn<T, E>>,
 }
 
 impl<T, E> std::fmt::Debug for Plan<T, E> {
@@ -42,6 +48,7 @@ impl<T, E> std::fmt::Debug for Plan<T, E> {
             .field("breaker", &self.breaker)
             .field("concurrency", &self.concurrency)
             .field("on_event", &self.on_event.as_ref().map(|_| "<fn>"))
+            .field("fallback", &self.fallback.as_ref().map(|_| "<async fn>"))
             .finish()
     }
 }

@@ -1,3 +1,4 @@
+#![cfg(feature = "test-util")]
 //! Integration: retry, backoff timing, and total-timeout behavior on a virtual clock.
 
 use std::sync::atomic::{AtomicU32, Ordering};

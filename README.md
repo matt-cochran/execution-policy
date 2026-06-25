@@ -246,6 +246,29 @@ A timeout drops the operation future — it does **not** abort remote or blockin
 work the operation started. The engine is built around a `select!`-style seam, so
 cooperative `CancellationToken` support can be added without breaking the API.
 
+## Why not a composable strategy pipeline?
+
+The bundled builder already covers ~90 % of real-world composition needs. In
+particular it provides **both timeout orderings** through separate knobs —
+`attempt_timeout` (per-attempt, inside the retry loop) and `total_timeout`
+(overall deadline including backoff), plus retry · retry-after hints ·
+circuit breaker · concurrency · fallback in a sensible fixed order.
+
+A composable *pipeline* in the style of Polly v8 or Tower would add:
+
+- A `Strategy` trait (or similar abstraction layer)
+- Per-layer boxed futures and explicit ordering semantics
+- Combinatorial tests for every valid and invalid ordering
+
+…for mostly long-tail value: custom third-party strategies, exotic orderings,
+request hedging. That overlap is already served by `tower` and
+`tower-resilience`, which this crate deliberately is NOT — it targets
+anything that isn't a Tower `Service`.
+
+**Migration path if ever needed:** introduce a `Strategy` trait and keep the
+builder as a facade that assembles a default pipeline — a non-breaking,
+opt-in evolution with no API churn for existing callers.
+
 ## License
 
 BSD-3-Clause.

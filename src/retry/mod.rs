@@ -172,7 +172,7 @@ impl<T, E> Retry<T, E> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 mod retry_tests {
     use super::*;
     use crate::core::{ManualClock, TestCore};

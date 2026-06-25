@@ -53,6 +53,32 @@ where
     C: Core,
     F: AsyncFnMut(Attempt<'_>) -> Result<T, E>,
 {
+    let result = run_inner(core, plan, op).await;
+
+    // --- Fallback (outermost, fires on any terminal error from the inner stack). ---
+    match (result, &plan.fallback) {
+        (Err(terminal), Some(fb)) => {
+            let ctx = Box::new(terminal.context().clone());
+            let attempts = ctx.attempts;
+            emit(&plan.on_event, || Event::FallbackInvoked { attempts });
+            match fb(&terminal).await {
+                Ok(v) => Ok(v),
+                Err(e) => Err(ExecutionError::Operation {
+                    source: e,
+                    context: ctx,
+                }),
+            }
+        }
+        (r, _) => r,
+    }
+}
+
+/// Inner pipeline without the fallback wrapper.
+async fn run_inner<C, F, T, E>(core: &C, plan: &Plan<T, E>, op: F) -> Result<T, ExecutionError<E>>
+where
+    C: Core,
+    F: AsyncFnMut(Attempt<'_>) -> Result<T, E>,
+{
     let start = core.now();
     let total_deadline = plan.total_timeout.map(|t| start + t);
 
@@ -406,7 +432,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-util"))]
 mod tests {
     use super::*;
     use crate::core::{ManualClock, TestCore};
@@ -425,6 +451,7 @@ mod tests {
             breaker: None,
             concurrency: None,
             on_event: None,
+            fallback: None,
         }
     }
 
@@ -485,6 +512,7 @@ mod tests {
             breaker: None,
             concurrency: None,
             on_event: None,
+            fallback: None,
         }
     }
 
@@ -600,5 +628,136 @@ mod tests {
         .await;
 
         assert_eq!(result.unwrap(), 7);
+    }
+
+    // ---- fallback tests ----
+
+    fn plan_with_fallback(
+        retry: Retry<u32, &'static str>,
+        fb: crate::plan::FallbackFn<u32, &'static str>,
+    ) -> Plan<u32, &'static str> {
+        Plan {
+            retry,
+            attempt_timeout: None,
+            total_timeout: None,
+            breaker: None,
+            concurrency: None,
+            on_event: None,
+            fallback: Some(fb),
+        }
+    }
+
+    /// Fallback fires after retries are exhausted and returns Ok — overall success.
+    #[tokio::test]
+    async fn fallback_recovers_after_exhausted_retries() {
+        let core = TestCore::new(ManualClock::new());
+        let p = plan_with_fallback(
+            Retry::fixed(Duration::ZERO).max_attempts(2),
+            Box::new(|_e| Box::pin(async { Ok::<u32, &'static str>(99) })),
+        );
+        let result = run_pipeline(&core, &p, async |_a| Err::<u32, _>("always")).await;
+        assert_eq!(result.unwrap(), 99);
+    }
+
+    /// Fallback receives the error and can discriminate on circuit-open.
+    #[tokio::test]
+    async fn fallback_can_discriminate_circuit_open() {
+        use crate::breaker::CircuitBreaker;
+        use crate::plan::CompiledBreaker;
+        let core = TestCore::new(ManualClock::new());
+        let (runtime, record_when) = CircuitBreaker::consecutive_failures(1)
+            .open_for(Duration::from_secs(30))
+            .compile();
+        // Trip the breaker first.
+        let runtime = std::sync::Arc::new(runtime);
+        let _ = runtime.gate(core.now());
+        runtime.record_failure(core.now());
+        // Now it's open.
+        let p = Plan {
+            retry: Retry::none(),
+            attempt_timeout: None,
+            total_timeout: None,
+            breaker: Some(CompiledBreaker {
+                runtime,
+                record_when,
+            }),
+            concurrency: None,
+            on_event: None,
+            fallback: Some(Box::new(|e| {
+                let is_open = e.is_circuit_open();
+                Box::pin(async move {
+                    if is_open {
+                        Ok::<u32, &'static str>(42)
+                    } else {
+                        Err("unexpected")
+                    }
+                })
+            })),
+        };
+        let result = run_pipeline(&core, &p, async |_a| Ok::<u32, &'static str>(1)).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    /// Fallback fires after an attempt timeout.
+    #[tokio::test]
+    async fn fallback_fires_on_attempt_timeout() {
+        let clock = ManualClock::new();
+        let core = TestCore::new(clock.clone());
+        let p = Plan {
+            retry: Retry::none(),
+            attempt_timeout: Some(Duration::from_millis(10)),
+            total_timeout: None,
+            breaker: None,
+            concurrency: None,
+            on_event: None,
+            fallback: Some(Box::new(|e| {
+                let is_timeout = e.is_timeout();
+                Box::pin(async move {
+                    if is_timeout {
+                        Ok::<u32, &'static str>(55)
+                    } else {
+                        Err("wrong")
+                    }
+                })
+            })),
+        };
+        let driver = async {
+            run_pipeline(&core, &p, async |_a| {
+                std::future::pending::<Result<u32, &'static str>>().await
+            })
+            .await
+        };
+        tokio::pin!(driver);
+        let advancer = async {
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            clock.advance(Duration::from_millis(10));
+        };
+        let (result, _) = tokio::join!(driver, advancer);
+        assert_eq!(result.unwrap(), 55);
+    }
+
+    /// Without a fallback configured, behavior is unchanged (no-fallback path).
+    #[tokio::test]
+    async fn no_fallback_path_unchanged() {
+        let core = TestCore::new(ManualClock::new());
+        let p = plan(Retry::fixed(Duration::ZERO).max_attempts(2), None, None);
+        let result: Result<u32, _> =
+            run_pipeline(&core, &p, async |_a| Err::<u32, _>("always")).await;
+        assert!(result.unwrap_err().is_exhausted());
+    }
+
+    /// When the fallback itself errors, it wraps into ExecutionError::Operation.
+    #[tokio::test]
+    async fn fallback_own_error_propagates() {
+        let core = TestCore::new(ManualClock::new());
+        let p = plan_with_fallback(
+            Retry::none(),
+            Box::new(|_e| Box::pin(async { Err::<u32, &'static str>("fallback-failed") })),
+        );
+        let result = run_pipeline(&core, &p, async |_a| Err::<u32, _>("primary")).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.into_inner(), Some("fallback-failed"));
     }
 }

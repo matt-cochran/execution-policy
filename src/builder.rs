@@ -8,8 +8,9 @@ use crate::concurrency::ConcurrencyLimit;
 use crate::core::Core;
 #[cfg(feature = "tokio")]
 use crate::core::DefaultCore;
+use crate::error::ExecutionError;
 use crate::event::{Event, EventHook};
-use crate::plan::{CompiledBreaker, Plan};
+use crate::plan::{CompiledBreaker, FallbackFn, Plan};
 use crate::policy::ExecutionPolicy;
 use crate::retry::Retry;
 
@@ -32,6 +33,7 @@ pub struct ExecutionPolicyBuilder<T, E> {
     breaker: Option<CircuitBreaker<E>>,
     concurrency: Option<ConcurrencyLimit>,
     on_event: Option<EventHook>,
+    fallback: Option<FallbackFn<T, E>>,
 }
 
 impl<T, E> std::fmt::Debug for ExecutionPolicyBuilder<T, E> {
@@ -43,6 +45,7 @@ impl<T, E> std::fmt::Debug for ExecutionPolicyBuilder<T, E> {
             .field("breaker", &self.breaker)
             .field("concurrency", &self.concurrency)
             .field("on_event", &self.on_event.as_ref().map(|_| "<fn>"))
+            .field("fallback", &self.fallback.as_ref().map(|_| "<async fn>"))
             .finish()
     }
 }
@@ -56,6 +59,7 @@ impl<T, E> Default for ExecutionPolicyBuilder<T, E> {
             breaker: None,
             concurrency: None,
             on_event: None,
+            fallback: None,
         }
     }
 }
@@ -106,6 +110,33 @@ impl<T, E> ExecutionPolicyBuilder<T, E> {
         self.on_event(|e: &Event| tracing::debug!(event = ?e, "execution-policy"))
     }
 
+    /// Register an async fallback of last resort.
+    ///
+    /// Invoked when the bundled policy yields a **terminal** `ExecutionError<E>` —
+    /// after retries, the circuit breaker, timeouts, and concurrency limits have
+    /// all run. The closure receives the final error so you can discriminate by
+    /// failure class (`is_timeout()`, `is_circuit_open()`, `is_rejected()`,
+    /// `is_exhausted()`, `into_inner()`).
+    ///
+    /// **Async** so the fallback can do I/O — fetch a cached value, query an
+    /// alternate endpoint, return a sentinel. Return `Ok(T)` to recover; return
+    /// `Err(E)` to propagate the fallback's own failure (wrapped into
+    /// `ExecutionError::Operation` preserving the original diagnostic context).
+    ///
+    /// # Composition
+    ///
+    /// Sits **outside** the retry/breaker/timeout/concurrency stack. Those
+    /// policies run unchanged; the fallback fires only when they all give up.
+    /// No fallback set → unchanged behavior (additive, non-breaking).
+    pub fn fallback<F, Fut>(mut self, f: F) -> Self
+    where
+        F: Fn(&ExecutionError<E>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<T, E>> + Send + 'static,
+    {
+        self.fallback = Some(Box::new(move |e| Box::pin(f(e))));
+        self
+    }
+
     fn validate(&self) -> Result<(), BuildError> {
         if let Some(r) = &self.retry {
             if r.max_attempts_value() == 0 {
@@ -138,6 +169,7 @@ impl<T, E> ExecutionPolicyBuilder<T, E> {
             breaker,
             concurrency,
             on_event: self.on_event,
+            fallback: self.fallback,
         }
     }
 

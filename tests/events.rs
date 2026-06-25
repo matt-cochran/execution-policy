@@ -1,3 +1,4 @@
+#![cfg(feature = "test-util")]
 //! Integration: the `on_event` observability hook.
 
 use std::sync::{Arc, Mutex};
