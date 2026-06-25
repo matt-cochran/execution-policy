@@ -315,28 +315,29 @@ A timeout drops the operation future — it does **not** abort remote or blockin
 work the operation started. The engine is built around a `select!`-style seam, so
 cooperative `CancellationToken` support can be added without breaking the API.
 
-## Why not a composable strategy pipeline?
+## Design — guardrails, what you own, and non-goals
 
-The bundled builder already covers ~90 % of real-world composition needs. In
-particular it provides **both timeout orderings** through separate knobs —
-`attempt_timeout` (per-attempt, inside the retry loop) and `total_timeout`
-(overall deadline including backoff), plus retry · retry-after hints ·
-circuit breaker · concurrency in a sensible fixed order.
+### Guardrails (what the crate protects you from)
 
-A composable *pipeline* in the style of Polly v8 or Tower would add:
+- **Bounded retries** — `max_attempts` + `total_timeout` + retry **budgets** (shared token bucket) ensure a failing dependency can't trigger a retry storm.
+- **Jitter** (`Jitter::Full` / `Jitter::Equal`) spreads retries across callers, avoiding synchronized thundering-herd bursts.
+- **Circuit breaker** sheds load off a failing dependency and recovers automatically via half-open probing.
+- **`retry_after`** honors server-provided backpressure (HTTP `Retry-After`, gRPC `RetryInfo`, queue throttle headers) as a floor on the next backoff delay.
+- **Typed `ExecutionError<E>`** preserves the failure signal — timeout / circuit-open / rejected / exhausted — and never collapses it to a generic string. Predicates (`is_timeout()`, `is_circuit_open()`, etc.) let you discriminate without matching.
 
-- A `Strategy` trait (or similar abstraction layer)
-- Per-layer boxed futures and explicit ordering semantics
-- Combinatorial tests for every valid and invalid ordering
+### What you own (deliberately NOT in the policy)
 
-…for mostly long-tail value: custom third-party strategies, exotic orderings,
-request hedging. That overlap is already served by `tower` and
-`tower-resilience`, which this crate deliberately is NOT — it targets
-anything that isn't a Tower `Service`.
+- **Idempotency** — the policy never assumes a call is safe to retry. YOU classify what's retryable via `.when(...)`. This is the single most important footgun the crate refuses to guess for you: retrying a non-idempotent write causes duplicates.
+- **Recovery / fallback** — handled at the call site with `.or_else(...)` on the returned `Result<T, ExecutionError<E>>`, not a policy knob. Keeping business logic out keeps the policy a reusable resilience primitive. See [Recovery / fallback at the call site](#recovery--fallback-at-the-call-site) for the composable `.or_else` pattern.
+- **Transport** — HTTP/gRPC/queue header parsing lives in your crate. The crate has no `http`/`reqwest` dependency; your closure receives `&E` and returns a `Duration`.
 
-**Migration path if ever needed:** introduce a `Strategy` trait and keep the
-builder as a facade that assembles a default pipeline — a non-breaking,
-opt-in evolution with no API churn for existing callers.
+### Non-goals & possible future directions
+
+These are deliberately out of scope today. Each note states the trigger that would make it worth adding and the rough approach — not a promise or roadmap.
+
+- **Composable strategy pipeline** (Polly-v8 / Tower style) — *Trigger:* need for third-party custom strategies, caller-controlled exotic ordering, or multiple same-type layers (e.g. two circuit breakers). *Approach:* a `Strategy` trait, with the existing builder kept as a facade that assembles a default pipeline — non-breaking, opt-in, no API churn for existing callers. *Why not now:* the builder already covers ~90 % of real-world needs including both timeout orderings (`attempt_timeout` inside the loop, `total_timeout` as overall deadline); the remaining long-tail overlaps `tower`/`tower-resilience`, which this crate deliberately is not.
+- **Hedging** (fire a speculative backup attempt for slow requests; take whichever finishes first; cancel the loser) — *Trigger:* idempotent reads hitting multiple replicas/backends with tail-latency (p99) SLOs. *Approach:* concurrent attempts + cancellation, gated to idempotent ops only via the `.when(...)` predicate. *Why not now:* dangerous for non-idempotent ops, and pointless against a single backend (it just doubles load rather than improving latency).
+- **Cross-hop deadline propagation** (thread the remaining time budget across service calls, like `grpc-timeout`) — *Trigger:* multi-hop synchronous call chains where A→B→C each consume part of an inbound deadline. *Approach:* expose a `remaining()` accessor on the policy so the consumer seeds `total_timeout` from an inbound deadline and writes the outbound deadline header; header read/write stays in the consumer/transport layer and the crate remains transport-agnostic. *Why not now:* single-hop usage doesn't need it, and deadline propagation is a transport/context concern rather than a per-operation policy concern.
 
 ## License
 
