@@ -91,3 +91,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-features
+
+  # Single aggregation gate. Make THIS the only required status check in branch
+  # protection; it turns green only when every job above succeeded. `if: always()`
+  # ensures it still runs (and fails) when an upstream job fails or is skipped, so
+  # a failure can't slip through as a skipped-but-"passing" required check.
+  ci-pass:
+    name: CI passed
+    if: always()
+    needs: [fmt, clippy, build, test, msrv]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all required jobs succeeded
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+        run: |
+          echo "One or more required jobs did not succeed:"
+          echo "  fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} build=${{ needs.build.result }} test=${{ needs.test.result }} msrv=${{ needs.msrv.result }}"
+          exit 1
