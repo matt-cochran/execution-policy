@@ -62,7 +62,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build ${{ matrix.features }}
 
-  # Configs WITH test-util run the full suite (unit + integration + benches build).
+  # Configs WITH test-util run the full suite: unit + integration + doctests
+  # (`cargo test` runs doctests by default, so they need no separate job) and a
+  # bench-target build check.
   test:
     name: test (${{ matrix.features }})
     needs: clippy
@@ -89,13 +91,3 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-features
-
-  docs:
-    name: doc tests
-    needs: clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --doc --all-features
