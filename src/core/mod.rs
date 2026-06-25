@@ -19,7 +19,12 @@ pub use test::{ManualClock, TestCore};
 
 /// A boxed future. [`Core::sleep`] returns this so the trait stays object-safe
 /// (`Arc<dyn Core>` works); the box is on the cold backoff path only.
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+///
+/// `+ Send` so the engine future (and therefore `ExecutionPolicy::run`/`execute`)
+/// is `Send` and can be `.await`ed inside `async-trait` `Send` futures and
+/// `tokio::spawn`. Both cores already produce `Send` sleeps (Tokio's `Sleep` is
+/// `Send`; `TestCore`'s `ManualSleep` is `Arc<Mutex<…>>`-backed).
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The policy engine's access to time, sleeping, and randomness.
 ///

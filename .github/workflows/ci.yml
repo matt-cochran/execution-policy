@@ -5,18 +5,53 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel superseded runs on the same ref to avoid wasting build minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Pipeline order (fail fast, cheapest first):
+#   fmt  ──▶  clippy  ──▶  { build, test, msrv, docs }
+# A formatting slip stops the run in seconds; a lint failure stops it before any
+# build/test minutes are spent.
 jobs:
-  # Configs WITHOUT test-util only build the library — the test suite needs
-  # TestCore/ManualClock (the test-util feature) to compile.
+  # 1. Cheapest gate: formatting only, no compilation. Fails in seconds.
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # 2. Lint gate: one clippy compile across feature configs. Runs only if fmt passed.
+  clippy:
+    name: clippy
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features --features test-util -- -D warnings
+
+  # 3. Heavy jobs: only after fmt + clippy are green.
+  # Configs WITHOUT test-util build the library only (the suite needs test-util).
   build:
     name: build (${{ matrix.features }})
+    needs: clippy
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         features:
           - "--no-default-features"
@@ -27,12 +62,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build ${{ matrix.features }}
 
-  # Configs WITH test-util run the full suite (unit + integration + benches build).
+  # Configs WITH test-util run the full suite: unit + integration + doctests
+  # (`cargo test` runs doctests by default, so they need no separate job) and a
+  # bench-target build check.
   test:
     name: test (${{ matrix.features }})
+    needs: clippy
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         features:
           - ""
@@ -44,21 +82,9 @@ jobs:
       - run: cargo build --all-targets ${{ matrix.features }}
       - run: cargo test ${{ matrix.features }}
 
-  lint:
-    name: fmt + clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo clippy --all-targets --no-default-features --features test-util -- -D warnings
-
   msrv:
     name: msrv (1.85)
+    needs: clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,11 +92,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --all-features
 
-  docs:
-    name: doc tests
+  # Single aggregation gate. Make THIS the only required status check in branch
+  # protection; it turns green only when every job above succeeded. `if: always()`
+  # ensures it still runs (and fails) when an upstream job fails or is skipped, so
+  # a failure can't slip through as a skipped-but-"passing" required check.
+  ci-pass:
+    name: CI passed
+    if: always()
+    needs: [fmt, clippy, build, test, msrv]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --doc --all-features
+      - name: Verify all required jobs succeeded
+        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+        run: |
+          echo "One or more required jobs did not succeed:"
+          echo "  fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} build=${{ needs.build.result }} test=${{ needs.test.result }} msrv=${{ needs.msrv.result }}"
+          exit 1
