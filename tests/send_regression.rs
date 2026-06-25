@@ -9,7 +9,11 @@
 //!
 //! Style: one declarative behavioral assertion per test.
 
-use execution_policy::{BoxFuture, CircuitBreaker, ExecutionPolicyBuilder, Jitter, Retry};
+use execution_policy::BoxFuture;
+
+#[cfg(feature = "tokio")]
+use execution_policy::{CircuitBreaker, ExecutionPolicyBuilder, Jitter, Retry};
+#[cfg(feature = "tokio")]
 use std::time::Duration;
 
 /// The `BoxFuture` alias the engine threads through `run`/`execute` is `Send` — the root property.
@@ -20,6 +24,7 @@ fn box_future_is_send() {
 }
 
 /// A bare policy's `run` future is `Send`: spawned onto the runtime, it yields the operation value.
+#[cfg(feature = "tokio")]
 #[tokio::test]
 async fn run_future_is_send() {
     let policy = ExecutionPolicyBuilder::<i32, ()>::new().build();
@@ -30,6 +35,7 @@ async fn run_future_is_send() {
 }
 
 /// A policy's `execute` future (the attempt-aware entry point) is `Send`.
+#[cfg(feature = "tokio")]
 #[tokio::test]
 async fn execute_future_is_send() {
     let policy = ExecutionPolicyBuilder::<i32, ()>::new().build();
@@ -42,6 +48,7 @@ async fn execute_future_is_send() {
 
 /// A fully-composed policy (retry + attempt/total timeout + circuit breaker) keeps its `run`
 /// future `Send`: the composed engine future also survives `tokio::spawn`.
+#[cfg(feature = "tokio")]
 #[tokio::test]
 async fn composed_policy_run_future_is_send() {
     let policy = ExecutionPolicyBuilder::<i32, ()>::new()
