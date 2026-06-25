@@ -1,0 +1,42 @@
+[package]
+name = "execution-policy"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "BSD-3-Clause"
+description = "Closure-first, runtime-light reliability policies (retry, timeout, circuit breaking, bounded concurrency, retry budgets) for any async Rust operation."
+repository = "https://github.com/matt-cochran/execution-policy"
+documentation = "https://docs.rs/execution-policy"
+readme = "README.md"
+keywords = ["resilience", "retry", "circuit-breaker", "timeout", "reliability"]
+categories = ["asynchronous", "concurrency"]
+exclude = ["/.github", "/docs"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# test-util is default-on so `cargo test`/`cargo bench`/examples work out of the
+# box. It pulls in NO extra dependencies (pure std). For a lean production build,
+# use `default-features = false, features = ["tokio"]`.
+default = ["tokio", "test-util"]
+tokio = ["dep:tokio"]
+test-util = []
+tracing = ["dep:tracing"]
+
+[dependencies]
+tokio = { version = "1", features = ["time", "sync"], optional = true }
+tracing = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt", "time"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "overhead"
+harness = false
+required-features = ["test-util"]
+
+[lints.rust]
+missing_debug_implementations = "warn"
