@@ -27,8 +27,6 @@ pub enum Event {
     ConcurrencyRejected,
     /// A retry was denied because the shared retry budget was exhausted.
     RetryBudgetExhausted { attempts: u32 },
-    /// The fallback handler was invoked after a terminal failure.
-    FallbackInvoked { attempts: u32 },
 }
 
 /// A registered event callback. Synchronous and cheap by contract; a panicking

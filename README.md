@@ -209,50 +209,25 @@ The same mechanism applies equally to **gRPC** (`RetryInfo` delay), **databases*
 (connection-pool saturation hints), and **message queues** (throttle backoff
 directives) — any transport that embeds an explicit delay in its error type.
 
-## Fallback chain
+## Recovery / fallback at the call site
 
-Register one or more async fallback links with `.fallback(...)`. Each call
-**appends** a link; links run in registration order on a terminal failure (after
-all retries, timeouts, the circuit breaker, and concurrency limits have given
-up). The **first link that returns `Ok(T)` wins** — subsequent links are not
-called. If all links decline by returning `Err`, the **original**
-`ExecutionError<E>` propagates (not any link's error). Each link receives the
-original `ExecutionError<E>` for failure-class discrimination.
+The policy returns `Result<T, ExecutionError<E>>` — resilience ends there. Recovery (deciding what to return on failure) is business logic that belongs at the call site, not inside a reusable resilience policy; keeping it out via `or_else` also gives you full call context and keeps the policy pure.
 
 ```rust,ignore
-let policy = ExecutionPolicyBuilder::<_, MyError>::new()
-    .retry(Retry::exponential().max_attempts(4))
-    .circuit_breaker(CircuitBreaker::consecutive_failures(5).open_for(Duration::from_secs(30)))
-    // link 1: try the local cache
-    .fallback(|e: &ExecutionError<MyError>| async move {
-        if e.is_circuit_open() || e.is_exhausted() {
-            cache.get_stale().await
-        } else {
-            Err(MyError::NotCached)
-        }
-    })
-    // link 2: try a read replica
-    .fallback(|_e| async move { replica.get().await })
-    // link 3: return a safe default sentinel
-    .fallback(|_e| async move { Ok(MyValue::default()) })
-    .build();
+let value = policy
+    .run(op)
+    .await
+    .or_else(|e| if e.is_circuit_open() { cache.get_stale() } else { Err(e) })
+    .or_else(|e| if e.is_exhausted()   { replica.get()      } else { Err(e) })
+    .or_else(|e| if e.is_timeout()     { Ok(sentinel())     } else { Err(e) })
+    .or_else(|_| Ok(default()))?;
 ```
 
-**Semantics:**
-- Additive — each `.fallback(...)` appends, never replaces.
-- In-order — links fire in registration order.
-- First-Ok-wins — once a link returns `Ok(T)`, the chain stops.
-- Each link sees the **original** `ExecutionError` (not a prior link's error),
-  so you can discriminate by class: `is_timeout()`, `is_circuit_open()`,
-  `is_rejected()`, `is_exhausted()`.
-- All-decline → **original error propagates** (not a link's `Err`).
-- No fallback registered → unchanged behavior (additive, non-breaking).
+Links run in order; the first `Ok` wins — native Rust, no special API. Each closure can discriminate via `e.is_circuit_open()` / `e.is_timeout()` / `e.is_exhausted()` / `e.into_inner()`.
 
-## HTTP reqwest example
+### HTTP reqwest + retry-after + cache recovery
 
-`execution-policy` has **no http/reqwest dependency** — header parsing lives in
-your crate. The closure receives `&E`; you extract the hint field and pass it
-to `.retry_after(f)`.
+`execution-policy` has **no http/reqwest dependency** — header parsing lives in your crate. Parse the `Retry-After` header into your error type; `.retry_after(f)` honors it as a floor on the next backoff delay inside the policy. Cache recovery is a plain `.or_else(...)` after `policy.run(...)`.
 
 ```rust,ignore
 use std::time::Duration;
@@ -294,13 +269,13 @@ let policy = ExecutionPolicyBuilder::<_, ApiError>::new()
             .retry_after(|e: &ApiError| e.retry_after()),
     )
     .total_timeout(Duration::from_secs(30))
-    // serve from cache while the upstream is throttling or down
-    .fallback(|_e: &ExecutionError<ApiError>| async move {
-        cache.get_stale().await.map_err(|_| ApiError { inner: todo!(), retry_after: None })
-    })
     .build();
 
-let body = policy.run(async || call(&client, "https://api.example.com/data").await).await?;
+// Recovery is call-site composition — serve from cache while the upstream is throttling or down.
+let body = policy
+    .run(async || call(&client, "https://api.example.com/data").await)
+    .await
+    .or_else(|_e: ExecutionError<ApiError>| cache.get_stale())?;
 ```
 
 ## Retry budgets
@@ -346,7 +321,7 @@ The bundled builder already covers ~90 % of real-world composition needs. In
 particular it provides **both timeout orderings** through separate knobs —
 `attempt_timeout` (per-attempt, inside the retry loop) and `total_timeout`
 (overall deadline including backoff), plus retry · retry-after hints ·
-circuit breaker · concurrency · fallback in a sensible fixed order.
+circuit breaker · concurrency in a sensible fixed order.
 
 A composable *pipeline* in the style of Polly v8 or Tower would add:
 
