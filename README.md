@@ -154,6 +154,61 @@ let policy = ExecutionPolicyBuilder::<u32, &str>::new()
 Enable the `tracing` feature and call `.with_tracing()` to bridge events to
 `tracing` automatically.
 
+## Honor a server's retry-after hint
+
+Some servers tell you exactly how long to wait — HTTP `Retry-After`, gRPC
+`RetryInfo`, database backpressure headers, queue throttle responses. Pass a
+closure to `.retry_after(f)` and it acts as a **floor** on the next backoff
+delay: the engine uses `max(backoff, hint)`. The hint is still capped by
+`max_backoff` (if set), and if honoring it would overshoot the `total_timeout`
+budget, the engine stops rather than overshooting.
+
+**This crate has NO http/reqwest dependency.** Your closure receives `&E` —
+you extract whatever field carries the hint, and the crate stays transport-agnostic.
+
+```rust
+use std::time::Duration;
+use execution_policy::{ExecutionPolicyBuilder, Retry};
+
+// Your error type — could be an HTTP, gRPC, DB, or queue error.
+struct ApiError {
+    retry_after_secs: Option<u64>,
+}
+
+let policy = ExecutionPolicyBuilder::<_, ApiError>::new()
+    .retry(
+        Retry::exponential()
+            .max_attempts(5)
+            .retry_after(|e: &ApiError| {
+                e.retry_after_secs.map(Duration::from_secs)
+            }),
+    )
+    .total_timeout(Duration::from_secs(30))
+    .build();
+```
+
+**HTTP example** — parse the `Retry-After` header in the consumer:
+
+```rust
+// (reqwest is YOUR dependency, not this crate's)
+let policy = ExecutionPolicyBuilder::<_, reqwest::Error>::new()
+    .retry(
+        Retry::exponential()
+            .max_attempts(4)
+            .when(|e: &reqwest::Error| e.status().map_or(false, |s| s == 429 || s.is_server_error()))
+            .retry_after(|_e: &reqwest::Error| {
+                // Caller parses the response header before returning the error.
+                // Example: store the hint in a thread-local or a wrapper type.
+                None // replace with your parsed Duration
+            }),
+    )
+    .build();
+```
+
+The same mechanism applies equally to **gRPC** (`RetryInfo` delay), **databases**
+(connection-pool saturation hints), and **message queues** (throttle backoff
+directives) — any transport that embeds an explicit delay in its error type.
+
 ## Retry budgets
 
 Bound retry storms across calls with a shared token bucket:
