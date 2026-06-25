@@ -36,7 +36,7 @@ pub(crate) struct Plan<T, E> {
     pub(crate) breaker: Option<CompiledBreaker<E>>,
     pub(crate) concurrency: Option<CompiledConcurrency>,
     pub(crate) on_event: Option<EventHook>,
-    pub(crate) fallback: Option<FallbackFn<T, E>>,
+    pub(crate) fallback: Vec<FallbackFn<T, E>>,
 }
 
 impl<T, E> std::fmt::Debug for Plan<T, E> {
@@ -48,7 +48,7 @@ impl<T, E> std::fmt::Debug for Plan<T, E> {
             .field("breaker", &self.breaker)
             .field("concurrency", &self.concurrency)
             .field("on_event", &self.on_event.as_ref().map(|_| "<fn>"))
-            .field("fallback", &self.fallback.as_ref().map(|_| "<async fn>"))
+            .field("fallback_chain_len", &self.fallback.len())
             .finish()
     }
 }

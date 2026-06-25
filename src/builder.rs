@@ -33,7 +33,7 @@ pub struct ExecutionPolicyBuilder<T, E> {
     breaker: Option<CircuitBreaker<E>>,
     concurrency: Option<ConcurrencyLimit>,
     on_event: Option<EventHook>,
-    fallback: Option<FallbackFn<T, E>>,
+    fallback: Vec<FallbackFn<T, E>>,
 }
 
 impl<T, E> std::fmt::Debug for ExecutionPolicyBuilder<T, E> {
@@ -45,7 +45,7 @@ impl<T, E> std::fmt::Debug for ExecutionPolicyBuilder<T, E> {
             .field("breaker", &self.breaker)
             .field("concurrency", &self.concurrency)
             .field("on_event", &self.on_event.as_ref().map(|_| "<fn>"))
-            .field("fallback", &self.fallback.as_ref().map(|_| "<async fn>"))
+            .field("fallback_chain_len", &self.fallback.len())
             .finish()
     }
 }
@@ -59,7 +59,7 @@ impl<T, E> Default for ExecutionPolicyBuilder<T, E> {
             breaker: None,
             concurrency: None,
             on_event: None,
-            fallback: None,
+            fallback: Vec::new(),
         }
     }
 }
@@ -110,30 +110,32 @@ impl<T, E> ExecutionPolicyBuilder<T, E> {
         self.on_event(|e: &Event| tracing::debug!(event = ?e, "execution-policy"))
     }
 
-    /// Register an async fallback of last resort.
+    /// Register an async fallback link in the fallback chain.
     ///
-    /// Invoked when the bundled policy yields a **terminal** `ExecutionError<E>` —
-    /// after retries, the circuit breaker, timeouts, and concurrency limits have
-    /// all run. The closure receives the final error so you can discriminate by
-    /// failure class (`is_timeout()`, `is_circuit_open()`, `is_rejected()`,
-    /// `is_exhausted()`, `into_inner()`).
+    /// Each call to `.fallback(...)` **appends** a link; the chain runs in
+    /// registration order on a terminal failure. The first link that returns
+    /// `Ok(T)` wins — subsequent links are not called. If all links return
+    /// `Err`, the **original** `ExecutionError<E>` propagates (not the last
+    /// link's error). With no fallbacks registered, behavior is unchanged.
     ///
-    /// **Async** so the fallback can do I/O — fetch a cached value, query an
-    /// alternate endpoint, return a sentinel. Return `Ok(T)` to recover; return
-    /// `Err(E)` to propagate the fallback's own failure (wrapped into
-    /// `ExecutionError::Operation` preserving the original diagnostic context).
+    /// Each link receives the **original** terminal `ExecutionError<E>` so it
+    /// can discriminate by failure class (`is_timeout()`, `is_circuit_open()`,
+    /// `is_rejected()`, `is_exhausted()`, `into_inner()`).
+    ///
+    /// **Async** so each link can do I/O — fetch a cached value, query a
+    /// replica, return a sentinel. Return `Ok(T)` to recover; return `Err(E)`
+    /// to decline and let the next link try.
     ///
     /// # Composition
     ///
     /// Sits **outside** the retry/breaker/timeout/concurrency stack. Those
-    /// policies run unchanged; the fallback fires only when they all give up.
-    /// No fallback set → unchanged behavior (additive, non-breaking).
+    /// policies run unchanged; the chain fires only when they all give up.
     pub fn fallback<F, Fut>(mut self, f: F) -> Self
     where
         F: Fn(&ExecutionError<E>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<T, E>> + Send + 'static,
     {
-        self.fallback = Some(Box::new(move |e| Box::pin(f(e))));
+        self.fallback.push(Box::new(move |e| Box::pin(f(e))));
         self
     }
 

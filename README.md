@@ -209,6 +209,100 @@ The same mechanism applies equally to **gRPC** (`RetryInfo` delay), **databases*
 (connection-pool saturation hints), and **message queues** (throttle backoff
 directives) — any transport that embeds an explicit delay in its error type.
 
+## Fallback chain
+
+Register one or more async fallback links with `.fallback(...)`. Each call
+**appends** a link; links run in registration order on a terminal failure (after
+all retries, timeouts, the circuit breaker, and concurrency limits have given
+up). The **first link that returns `Ok(T)` wins** — subsequent links are not
+called. If all links decline by returning `Err`, the **original**
+`ExecutionError<E>` propagates (not any link's error). Each link receives the
+original `ExecutionError<E>` for failure-class discrimination.
+
+```rust,ignore
+let policy = ExecutionPolicyBuilder::<_, MyError>::new()
+    .retry(Retry::exponential().max_attempts(4))
+    .circuit_breaker(CircuitBreaker::consecutive_failures(5).open_for(Duration::from_secs(30)))
+    // link 1: try the local cache
+    .fallback(|e: &ExecutionError<MyError>| async move {
+        if e.is_circuit_open() || e.is_exhausted() {
+            cache.get_stale().await
+        } else {
+            Err(MyError::NotCached)
+        }
+    })
+    // link 2: try a read replica
+    .fallback(|_e| async move { replica.get().await })
+    // link 3: return a safe default sentinel
+    .fallback(|_e| async move { Ok(MyValue::default()) })
+    .build();
+```
+
+**Semantics:**
+- Additive — each `.fallback(...)` appends, never replaces.
+- In-order — links fire in registration order.
+- First-Ok-wins — once a link returns `Ok(T)`, the chain stops.
+- Each link sees the **original** `ExecutionError` (not a prior link's error),
+  so you can discriminate by class: `is_timeout()`, `is_circuit_open()`,
+  `is_rejected()`, `is_exhausted()`.
+- All-decline → **original error propagates** (not a link's `Err`).
+- No fallback registered → unchanged behavior (additive, non-breaking).
+
+## HTTP reqwest example
+
+`execution-policy` has **no http/reqwest dependency** — header parsing lives in
+your crate. The closure receives `&E`; you extract the hint field and pass it
+to `.retry_after(f)`.
+
+```rust,ignore
+use std::time::Duration;
+use execution_policy::{ExecutionPolicyBuilder, ExecutionError, Retry};
+use reqwest::header::RETRY_AFTER;
+
+// Your error type wraps reqwest and carries the parsed hint.
+struct ApiError {
+    inner: reqwest::Error,
+    retry_after: Option<Duration>,
+}
+
+impl ApiError {
+    fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
+}
+
+// In your HTTP layer: parse the header before returning the error.
+async fn call(client: &reqwest::Client, url: &str) -> Result<String, ApiError> {
+    let resp = client.get(url).send().await.map_err(|e| ApiError { inner: e, retry_after: None })?;
+    if resp.status() == 429 || resp.status().is_server_error() {
+        let hint = resp
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs);
+        return Err(ApiError { inner: resp.error_for_status().unwrap_err(), retry_after: hint });
+    }
+    resp.text().await.map_err(|e| ApiError { inner: e, retry_after: None })
+}
+
+let policy = ExecutionPolicyBuilder::<_, ApiError>::new()
+    .retry(
+        Retry::exponential()
+            .max_attempts(5)
+            .when(|e: &ApiError| e.inner.status().map_or(false, |s| s == 429 || s.is_server_error()))
+            .retry_after(|e: &ApiError| e.retry_after()),
+    )
+    .total_timeout(Duration::from_secs(30))
+    // serve from cache while the upstream is throttling or down
+    .fallback(|_e: &ExecutionError<ApiError>| async move {
+        cache.get_stale().await.map_err(|_| ApiError { inner: todo!(), retry_after: None })
+    })
+    .build();
+
+let body = policy.run(async || call(&client, "https://api.example.com/data").await).await?;
+```
+
 ## Retry budgets
 
 Bound retry storms across calls with a shared token bucket:

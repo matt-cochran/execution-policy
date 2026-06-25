@@ -55,22 +55,20 @@ where
 {
     let result = run_inner(core, plan, op).await;
 
-    // --- Fallback (outermost, fires on any terminal error from the inner stack). ---
-    match (result, &plan.fallback) {
-        (Err(terminal), Some(fb)) => {
-            let ctx = Box::new(terminal.context().clone());
-            let attempts = ctx.attempts;
-            emit(&plan.on_event, || Event::FallbackInvoked { attempts });
-            match fb(&terminal).await {
-                Ok(v) => Ok(v),
-                Err(e) => Err(ExecutionError::Operation {
-                    source: e,
-                    context: ctx,
-                }),
-            }
+    // --- Fallback chain (outermost, fires on any terminal error from the inner stack). ---
+    // Links run in registration order; first Ok wins. All-decline → original error.
+    let Err(terminal) = result else {
+        return result;
+    };
+    for fb in &plan.fallback {
+        let attempts = terminal.context().attempts;
+        emit(&plan.on_event, || Event::FallbackInvoked { attempts });
+        if let Ok(v) = fb(&terminal).await {
+            return Ok(v);
         }
-        (r, _) => r,
+        // link declined (returned Err) — try the next link with the original terminal error
     }
+    Err(terminal)
 }
 
 /// Inner pipeline without the fallback wrapper.
@@ -451,7 +449,7 @@ mod tests {
             breaker: None,
             concurrency: None,
             on_event: None,
-            fallback: None,
+            fallback: vec![],
         }
     }
 
@@ -512,7 +510,7 @@ mod tests {
             breaker: None,
             concurrency: None,
             on_event: None,
-            fallback: None,
+            fallback: vec![],
         }
     }
 
@@ -643,7 +641,7 @@ mod tests {
             breaker: None,
             concurrency: None,
             on_event: None,
-            fallback: Some(fb),
+            fallback: vec![fb],
         }
     }
 
@@ -683,7 +681,7 @@ mod tests {
             }),
             concurrency: None,
             on_event: None,
-            fallback: Some(Box::new(|e| {
+            fallback: vec![Box::new(|e: &ExecutionError<&'static str>| {
                 let is_open = e.is_circuit_open();
                 Box::pin(async move {
                     if is_open {
@@ -691,8 +689,8 @@ mod tests {
                     } else {
                         Err("unexpected")
                     }
-                })
-            })),
+                }) as crate::core::BoxFuture<'_, Result<u32, &'static str>>
+            })],
         };
         let result = run_pipeline(&core, &p, async |_a| Ok::<u32, &'static str>(1)).await;
         assert_eq!(result.unwrap(), 42);
@@ -710,7 +708,7 @@ mod tests {
             breaker: None,
             concurrency: None,
             on_event: None,
-            fallback: Some(Box::new(|e| {
+            fallback: vec![Box::new(|e: &ExecutionError<&'static str>| {
                 let is_timeout = e.is_timeout();
                 Box::pin(async move {
                     if is_timeout {
@@ -718,8 +716,8 @@ mod tests {
                     } else {
                         Err("wrong")
                     }
-                })
-            })),
+                }) as crate::core::BoxFuture<'_, Result<u32, &'static str>>
+            })],
         };
         let driver = async {
             run_pipeline(&core, &p, async |_a| {
@@ -748,16 +746,118 @@ mod tests {
         assert!(result.unwrap_err().is_exhausted());
     }
 
-    /// When the fallback itself errors, it wraps into ExecutionError::Operation.
+    /// When the sole fallback link declines (returns Err), the ORIGINAL ExecutionError propagates.
     #[tokio::test]
-    async fn fallback_own_error_propagates() {
+    async fn fallback_decline_propagates_original_error() {
         let core = TestCore::new(ManualClock::new());
         let p = plan_with_fallback(
             Retry::none(),
-            Box::new(|_e| Box::pin(async { Err::<u32, &'static str>("fallback-failed") })),
+            Box::new(|_e| Box::pin(async { Err::<u32, &'static str>("fallback-declined") })),
         );
         let result = run_pipeline(&core, &p, async |_a| Err::<u32, _>("primary")).await;
         let err = result.unwrap_err();
-        assert_eq!(err.into_inner(), Some("fallback-failed"));
+        // original error ("primary"), not the fallback's error
+        assert_eq!(err.into_inner(), Some("primary"));
+    }
+
+    // ---- fallback chain tests ----
+
+    /// Chain: first link declines (Err) → second link recovers (Ok) → overall Ok.
+    #[tokio::test]
+    async fn fallback_chain_second_recovers_when_first_declines() {
+        let core = TestCore::new(ManualClock::new());
+        let p = Plan {
+            retry: Retry::fixed(Duration::ZERO).max_attempts(2),
+            attempt_timeout: None,
+            total_timeout: None,
+            breaker: None,
+            concurrency: None,
+            on_event: None,
+            fallback: vec![
+                // link 1: always declines
+                Box::new(|_e: &ExecutionError<&'static str>| {
+                    Box::pin(async { Err::<u32, &'static str>("link1-declined") })
+                        as crate::core::BoxFuture<'_, Result<u32, &'static str>>
+                }),
+                // link 2: recovers
+                Box::new(|_e: &ExecutionError<&'static str>| {
+                    Box::pin(async { Ok::<u32, &'static str>(77) })
+                        as crate::core::BoxFuture<'_, Result<u32, &'static str>>
+                }),
+            ],
+        };
+        let result = run_pipeline(&core, &p, async |_a| Err::<u32, _>("always")).await;
+        assert_eq!(result.unwrap(), 77);
+    }
+
+    /// Chain: first link recovers → second link is NEVER called (first-Ok-wins).
+    #[tokio::test]
+    async fn fallback_chain_first_ok_wins_second_never_called() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let core = TestCore::new(ManualClock::new());
+        let second_calls = std::sync::Arc::new(AtomicU32::new(0));
+        let second_calls2 = second_calls.clone();
+        let p = Plan {
+            retry: Retry::none(),
+            attempt_timeout: None,
+            total_timeout: None,
+            breaker: None,
+            concurrency: None,
+            on_event: None,
+            fallback: vec![
+                // link 1: recovers immediately
+                Box::new(|_e: &ExecutionError<&'static str>| {
+                    Box::pin(async { Ok::<u32, &'static str>(10) })
+                        as crate::core::BoxFuture<'_, Result<u32, &'static str>>
+                }),
+                // link 2: should never fire
+                Box::new(move |_e: &ExecutionError<&'static str>| {
+                    second_calls2.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok::<u32, &'static str>(99) })
+                        as crate::core::BoxFuture<'_, Result<u32, &'static str>>
+                }),
+            ],
+        };
+        let result = run_pipeline(&core, &p, async |_a| Err::<u32, _>("primary")).await;
+        assert_eq!(result.unwrap(), 10);
+        assert_eq!(
+            second_calls.load(Ordering::SeqCst),
+            0,
+            "second link must not be called"
+        );
+    }
+
+    /// Chain: all links decline → original ExecutionError propagates (is_exhausted()).
+    #[tokio::test]
+    async fn fallback_chain_all_decline_propagates_original() {
+        let core = TestCore::new(ManualClock::new());
+        let p = Plan {
+            retry: Retry::fixed(Duration::ZERO).max_attempts(2),
+            attempt_timeout: None,
+            total_timeout: None,
+            breaker: None,
+            concurrency: None,
+            on_event: None,
+            fallback: vec![
+                Box::new(|_e: &ExecutionError<&'static str>| {
+                    Box::pin(async { Err::<u32, &'static str>("link1-no") })
+                        as crate::core::BoxFuture<'_, Result<u32, &'static str>>
+                }),
+                Box::new(|_e: &ExecutionError<&'static str>| {
+                    Box::pin(async { Err::<u32, &'static str>("link2-no") })
+                        as crate::core::BoxFuture<'_, Result<u32, &'static str>>
+                }),
+            ],
+        };
+        let result: Result<u32, _> =
+            run_pipeline(&core, &p, async |_a| Err::<u32, _>("always")).await;
+        let err = result.unwrap_err();
+        // Must be the original ExecutionError — still is_exhausted(), not a link's error
+        assert!(err.is_exhausted(), "original error class must be preserved");
+        assert_eq!(
+            err.into_inner(),
+            Some("always"),
+            "original source error must propagate"
+        );
     }
 }
