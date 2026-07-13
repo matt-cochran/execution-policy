@@ -236,7 +236,10 @@ mod retry_tests {
         for seed in 0..256u64 {
             let core = TestCore::with_seed(ManualClock::new(), seed);
             let d = r.delay(6, &core, None); // attempt 6 → backoff clamps to cap
-            assert!(d <= cap, "seed {seed}: delay {d:?} exceeded backoff cap {cap:?}");
+            assert!(
+                d <= cap,
+                "seed {seed}: delay {d:?} exceeded backoff cap {cap:?}"
+            );
             if d < cap {
                 saw_below_cap = true;
             }
