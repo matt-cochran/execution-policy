@@ -157,12 +157,56 @@ impl BreakerRuntime {
         }
     }
 
-    /// Current public state.
+    /// Current public state, as last committed by a call (`gate`/`record_*`).
+    ///
+    /// This is the raw latched state and does NOT account for a cooldown that
+    /// has elapsed without an intervening call — prefer [`state_at`] for a
+    /// clock-accurate view when polling for a healthy target.
+    ///
+    /// [`state_at`]: Self::state_at
+    #[cfg(test)]
     pub(crate) fn state(&self) -> BreakerState {
         match self.state.load(Ordering::Acquire) {
             OPEN => BreakerState::Open,
             HALF_OPEN => BreakerState::HalfOpen,
             _ => BreakerState::Closed,
+        }
+    }
+
+    /// Reported state as a pure function of `now`.
+    ///
+    /// Unlike [`state`], this reports `HalfOpen` as soon as an open breaker's
+    /// cooldown has elapsed — without waiting for a call to arrive and drive
+    /// the lazy transition in [`gate`]. This makes breaker health *schedulable*:
+    /// a poller selecting a recovered target sees the change on time. The actual
+    /// state transition (and half-open probe accounting) still happens in
+    /// [`gate`]; this method never mutates.
+    ///
+    /// [`state`]: Self::state
+    /// [`gate`]: Self::gate
+    pub(crate) fn state_at(&self, now: Instant) -> BreakerState {
+        match self.state.load(Ordering::Acquire) {
+            OPEN => {
+                let inner = self.inner.lock().unwrap();
+                match inner.open_until {
+                    Some(t) if now >= t => BreakerState::HalfOpen,
+                    _ => BreakerState::Open,
+                }
+            }
+            HALF_OPEN => BreakerState::HalfOpen,
+            _ => BreakerState::Closed,
+        }
+    }
+
+    /// The instant at which the breaker stops cooling (leaves `Open`), while it
+    /// is still cooling. Returns `None` when closed, half-open, or when the
+    /// cooldown has already elapsed (i.e. ready to probe).
+    pub(crate) fn cooling_until(&self, now: Instant) -> Option<Instant> {
+        if self.state.load(Ordering::Acquire) == OPEN {
+            let inner = self.inner.lock().unwrap();
+            inner.open_until.filter(|t| now < *t)
+        } else {
+            None
         }
     }
 
@@ -419,6 +463,56 @@ mod tests {
         rt.record_failure(now);
         rt.record_failure(now); // 100% but only 2 calls < min 10
         assert_eq!(rt.state(), BreakerState::Closed);
+    }
+
+    #[test]
+    fn state_reports_half_open_after_cooldown_without_a_call() {
+        use crate::core::{Core, ManualClock, TestCore};
+        let (rt, _) = CircuitBreaker::<()>::consecutive_failures(1)
+            .open_for(Duration::from_secs(5))
+            .compile();
+        let clock = ManualClock::new();
+        let core = TestCore::new(clock.clone());
+        let now = core.now();
+        rt.record_failure(now);
+        assert_eq!(rt.state_at(now), BreakerState::Open);
+        // Advance past the cooldown with NO gate()/record call in between.
+        clock.advance(Duration::from_secs(6));
+        let later = core.now();
+        assert_eq!(
+            rt.state_at(later),
+            BreakerState::HalfOpen,
+            "breaker must report HalfOpen once cooldown elapses, without a call arriving"
+        );
+        // The lazy atomic hasn't transitioned yet — `state_at` is a pure clock fn.
+        assert_eq!(rt.state(), BreakerState::Open);
+    }
+
+    #[test]
+    fn cooling_until_tracks_open_window() {
+        use crate::core::{Core, ManualClock, TestCore};
+        let (rt, _) = CircuitBreaker::<()>::consecutive_failures(1)
+            .open_for(Duration::from_secs(5))
+            .compile();
+        let clock = ManualClock::new();
+        let core = TestCore::new(clock.clone());
+        let now = core.now();
+        // Closed → not cooling.
+        assert_eq!(rt.cooling_until(now), None);
+        rt.record_failure(now); // trip → Open
+        assert_eq!(rt.cooling_until(now), Some(now + Duration::from_secs(5)));
+        // Once the window elapses it is no longer cooling (ready to probe).
+        clock.advance(Duration::from_secs(6));
+        assert_eq!(rt.cooling_until(core.now()), None);
+    }
+
+    #[test]
+    fn cooling_until_none_while_closed() {
+        let (rt, _) = CircuitBreaker::<()>::consecutive_failures(3).compile();
+        let now = t0();
+        assert_eq!(rt.cooling_until(now), None);
+        rt.record_failure(now); // below threshold — still Closed
+        assert_eq!(rt.cooling_until(now), None);
     }
 
     #[test]

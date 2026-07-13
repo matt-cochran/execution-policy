@@ -45,17 +45,34 @@ impl<C, T, E> ExecutionPolicy<C, T, E> {
     pub(crate) fn from_parts(core: C, plan: Arc<Plan<T, E>>) -> Self {
         Self { core, plan }
     }
-
-    /// Current circuit-breaker state, or `None` if no breaker is configured.
-    pub fn circuit_state(&self) -> Option<crate::error::BreakerState> {
-        self.plan.breaker.as_ref().map(|b| b.runtime.state())
-    }
 }
 
 impl<C, T, E> ExecutionPolicy<C, T, E>
 where
     C: Core,
 {
+    /// Current circuit-breaker state, or `None` if no breaker is configured.
+    ///
+    /// The state is reported against the [`Core`] clock, so a breaker whose
+    /// cooldown has elapsed reads as `HalfOpen` immediately — without waiting
+    /// for a call to arrive and drive the transition. This makes breaker health
+    /// pollable when selecting a healthy target.
+    pub fn circuit_state(&self) -> Option<crate::error::BreakerState> {
+        let now = self.core.now();
+        self.plan.breaker.as_ref().map(|b| b.runtime.state_at(now))
+    }
+
+    /// The instant at which the breaker stops cooling (leaves `Open`), while it
+    /// is currently cooling. Returns `None` when no breaker is configured, when
+    /// it is closed or half-open, or when the cooldown has already elapsed.
+    pub fn cooling_until(&self) -> Option<std::time::Instant> {
+        let now = self.core.now();
+        self.plan
+            .breaker
+            .as_ref()
+            .and_then(|b| b.runtime.cooling_until(now))
+    }
+
     /// Run an operation that needs neither application state nor attempt metadata.
     pub async fn run<F>(&self, mut op: F) -> Result<T, ExecutionError<E>>
     where
