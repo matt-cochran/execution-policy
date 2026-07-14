@@ -65,6 +65,31 @@ async fn circuit_half_opens_then_closes() {
 }
 
 #[tokio::test]
+async fn circuit_state_reports_half_open_on_schedule_without_a_call() {
+    let clock = ManualClock::new();
+    let core = TestCore::new(clock.clone());
+    let policy = ExecutionPolicyBuilder::<u32, &str>::new()
+        .retry(Retry::none())
+        .circuit_breaker(CircuitBreaker::consecutive_failures(1).open_for(Duration::from_secs(5)))
+        .build_with(core);
+
+    assert!(policy.execute(async |_a| Err::<u32, _>("x")).await.is_err());
+    assert_eq!(policy.circuit_state(), Some(BreakerState::Open));
+    // While Open, `cooling_until` reports when the breaker stops cooling.
+    assert!(policy.cooling_until().is_some());
+
+    // Cooldown elapses with NO call arriving. A poller must see HalfOpen.
+    clock.advance(Duration::from_secs(6));
+    assert_eq!(
+        policy.circuit_state(),
+        Some(BreakerState::HalfOpen),
+        "breaker health must be schedulable — HalfOpen without an intervening call"
+    );
+    // No longer cooling once the window has elapsed.
+    assert_eq!(policy.cooling_until(), None);
+}
+
+#[tokio::test]
 async fn concurrency_reject_sheds_load() {
     let core = TestCore::new(ManualClock::new());
     let policy = ExecutionPolicyBuilder::<u32, &str>::new()

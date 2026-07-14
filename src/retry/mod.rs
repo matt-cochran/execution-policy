@@ -123,7 +123,8 @@ impl<T, E> Retry<T, E> {
     /// next delay is `max(backoff, hint)` — the hint acts as a **floor**.
     /// The result is still capped by `max_backoff` (if set) and will not
     /// exceed the remaining `total_timeout` budget (the engine stops instead
-    /// of overshooting). Jitter applies normally on top of the chosen delay.
+    /// of overshooting). Jitter applies only to the backoff component before
+    /// the floor, so the hint is a *hard* lower bound the delay never dips below.
     ///
     /// No HTTP, gRPC, or any other dependency is introduced — the closure
     /// receives `&E` and you parse whatever field you need.
@@ -147,21 +148,25 @@ impl<T, E> Retry<T, E> {
     /// Compute the next backoff delay.
     ///
     /// `last_err` is passed through to the retry-after extractor (if any).
-    /// When the extractor returns `Some(hint)`, the raw backoff is floored to
-    /// `hint` before jitter is applied. The cap at `max_backoff` (encoded in
+    /// Jitter is applied to the raw backoff first; when the extractor returns
+    /// `Some(hint)`, the jittered backoff is then floored to `hint` so the hint
+    /// is a hard lower bound. The cap at `max_backoff` (encoded in
     /// `Backoff::Exponential`) already happens inside `raw_delay`; the
     /// `total_timeout` budget check is done by the caller in `engine.rs`.
     pub(crate) fn delay(&self, attempt: u32, core: &dyn Core, last_err: Option<&E>) -> Duration {
         let backoff_raw = self.backoff.raw_delay(attempt);
-        // Apply retry-after hint as a floor (hint wins if larger).
+        // Jitter de-correlates the *backoff* component only. The retry-after
+        // hint is then applied as a hard floor, so jitter can never undercut a
+        // server-supplied Retry-After (with `Jitter::Full` it otherwise could
+        // sample far below the hint and hammer a throttled provider).
+        let jittered = self.jitter.apply(backoff_raw, core.next_u64());
         let hint = last_err
             .zip(self.retry_after.as_deref())
             .and_then(|(e, f)| f(e));
-        let raw = match hint {
-            Some(h) if h > backoff_raw => h,
-            _ => backoff_raw,
-        };
-        self.jitter.apply(raw, core.next_u64())
+        match hint {
+            Some(h) if h > jittered => h,
+            _ => jittered,
+        }
     }
     pub(crate) fn budget_ref(&self) -> Option<&RetryBudget> {
         self.budget.as_ref()
@@ -199,6 +204,50 @@ mod retry_tests {
         assert_eq!(r.delay(1, &core, None), Duration::from_millis(20));
         assert_eq!(r.delay(3, &core, None), Duration::from_millis(80));
         assert_eq!(r.delay(9, &core, None), Duration::from_millis(80));
+    }
+
+    #[test]
+    fn retry_after_floors_delay_across_seeds() {
+        // `standard()` uses `Jitter::Full`. The Retry-After hint must be a hard
+        // floor: jitter may only shrink the backoff component, never undercut
+        // the server-supplied hint. Drive many RNG seeds × attempts.
+        let r = Retry::<(), ()>::standard().retry_after(|_: &()| Some(Duration::from_secs(47)));
+        let floor = Duration::from_secs(47);
+        for seed in 0..2000u64 {
+            let core = TestCore::with_seed(ManualClock::new(), seed);
+            for attempt in 1..=6 {
+                let d = r.delay(attempt, &core, Some(&()));
+                assert!(
+                    d >= floor,
+                    "seed {seed}, attempt {attempt}: delay {d:?} undercut Retry-After floor {floor:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_hint_leaves_full_jitter_untouched() {
+        // Without a Retry-After hint, `Jitter::Full` still applies to the raw
+        // backoff and may fall below the backoff cap — behavior must be
+        // identical to before the floor fix.
+        let r = Retry::<(), ()>::standard();
+        let cap = Duration::from_secs(2); // standard() max backoff
+        let mut saw_below_cap = false;
+        for seed in 0..256u64 {
+            let core = TestCore::with_seed(ManualClock::new(), seed);
+            let d = r.delay(6, &core, None); // attempt 6 → backoff clamps to cap
+            assert!(
+                d <= cap,
+                "seed {seed}: delay {d:?} exceeded backoff cap {cap:?}"
+            );
+            if d < cap {
+                saw_below_cap = true;
+            }
+        }
+        assert!(
+            saw_below_cap,
+            "Full jitter never reduced the delay below the cap"
+        );
     }
 
     #[test]
