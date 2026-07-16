@@ -37,6 +37,7 @@ pub mod error;
 pub mod event;
 pub mod policy;
 pub mod retry;
+pub mod stall;
 
 pub(crate) mod engine;
 pub(crate) mod plan;
@@ -53,3 +54,4 @@ pub use crate::error::{BreakerState, ErrorContext, ExecutionError};
 pub use crate::event::Event;
 pub use crate::policy::ExecutionPolicy;
 pub use crate::retry::{Backoff, Jitter, Retry, RetryBudget};
+pub use crate::stall::{Progress, StallError, stall_timeout};
