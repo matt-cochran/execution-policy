@@ -96,9 +96,8 @@ where
             sleep = None; // re-arm to the new deadline
         }
         // Arm/poll the silence timer. Ready ⇒ `budget` elapsed with no tick.
-        let s = sleep.get_or_insert_with(|| {
-            core.sleep(deadline.saturating_duration_since(core.now()))
-        });
+        let s =
+            sleep.get_or_insert_with(|| core.sleep(deadline.saturating_duration_since(core.now())));
         if Pin::new(s).poll(cx).is_ready() {
             return Poll::Ready(Err(StallError::Stalled { idle: budget }));
         }
