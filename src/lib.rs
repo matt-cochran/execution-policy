@@ -35,8 +35,10 @@ pub mod concurrency;
 pub mod core;
 pub mod error;
 pub mod event;
+pub mod fallback;
 pub mod policy;
 pub mod retry;
+pub mod stall;
 
 pub(crate) mod engine;
 pub(crate) mod plan;
@@ -51,5 +53,9 @@ pub use crate::core::DefaultCore;
 pub use crate::core::{BoxFuture, Core};
 pub use crate::error::{BreakerState, ErrorContext, ExecutionError};
 pub use crate::event::Event;
+pub use crate::fallback::{
+    FallbackError, FallbackPolicy, FallbackPolicyBuilder, Selection, Served,
+};
 pub use crate::policy::ExecutionPolicy;
 pub use crate::retry::{Backoff, Jitter, Retry, RetryBudget};
+pub use crate::stall::{Progress, StallError, stall_timeout};
