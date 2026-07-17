@@ -16,6 +16,7 @@
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::hash::Hash;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use std::time::{Duration, Instant};
@@ -311,20 +312,10 @@ where
         Ok(cands[best.expect("healthy set is non-empty").0].index)
     }
 
-    /// Run `op` against members chosen by the `Pick` strategy. `op` receives the
-    /// chosen member id by reference.
-    ///
-    /// - A breaker-open member is skipped (its cooldown feeds the park hint).
-    /// - `Ok` → [`Served`] with the member id and how many members were attempted.
-    /// - A transient failure (per `advance_when`), timeout, breaker trip, or
-    ///   rejection advances to the next-best member.
-    /// - A **permanent** operation error fails fast with [`RouterError::Exhausted`].
-    /// - Every member cooling → [`RouterError::AllUnavailable`].
-    pub async fn run<F>(&self, mut op: F) -> Result<Served<Id, T>, RouterError<Id, E>>
-    where
-        F: AsyncFnMut(&Id) -> Result<T, E>,
-    {
-        // Healthy = breaker not Open; collect the soonest cooldown for the park hint.
+    /// Breaker-aware scan: healthy member indices, plus the soonest cooldown
+    /// among any Open members (the park hint if none turn out to be healthy).
+    /// Shared setup for `run` and `run_owned`.
+    fn healthy_members(&self) -> (Vec<usize>, Option<Instant>) {
         let mut soonest: Option<Instant> = None;
         let mut healthy: Vec<usize> = Vec::with_capacity(self.targets.len());
         for (i, t) in self.targets.iter().enumerate() {
@@ -336,6 +327,82 @@ where
                 healthy.push(i);
             }
         }
+        (healthy, soonest)
+    }
+
+    /// Meter + pick-count bookkeeping for one completed attempt (F2/F9/F11).
+    /// Must be called while the attempt's `InFlightGuard` is still held (the
+    /// meter sample reads current in-flight), before it drops. Shared by
+    /// `run` and `run_owned`.
+    fn record_attempt(&self, target: &Target<Id, C, T, E>, attempt_start: Instant, ok: bool) {
+        if let Some(meter) = &self.meter {
+            let now = self.core.now();
+            let mut cell = target.state.meter.lock().unwrap();
+            let last = cell.map(|c| c.last_update).unwrap_or(now);
+            let sample = Sample {
+                latency: now.saturating_duration_since(attempt_start),
+                at: now,
+                last_update: last,
+                in_flight: target.state.in_flight.load(AtomicOrdering::SeqCst),
+                ok,
+            };
+            *cell = Some(meter.fold(*cell, &sample));
+        }
+        target.state.pick_count.fetch_add(1, AtomicOrdering::SeqCst); // F11
+    }
+
+    /// Classify a completed attempt's outcome: success or a permanent
+    /// operation error both resolve the whole `run`/`run_owned` call
+    /// (`ControlFlow::Break`); a transient/timeout/breaker-trip/rejection
+    /// error folds into `last_err` and signals the caller to advance
+    /// (`ControlFlow::Continue`). Shared by `run` and `run_owned`.
+    fn after_attempt(
+        &self,
+        target: &Target<Id, C, T, E>,
+        attempts: u32,
+        outcome: Result<T, ExecutionError<E>>,
+        last_err: &mut Option<E>,
+    ) -> ControlFlow<Result<Served<Id, T>, RouterError<Id, E>>> {
+        match outcome {
+            Ok(value) => ControlFlow::Break(Ok(Served {
+                value,
+                target: target.id.clone(),
+                attempts,
+            })),
+            Err(e) => match &e {
+                // Permanent operation error → fail fast, do not burn the pool.
+                ExecutionError::Operation { source, .. } if !(self.advance_when)(source) => {
+                    ControlFlow::Break(Err(RouterError::Exhausted(
+                        e.into_inner().expect("Operation variant carries a source"),
+                    )))
+                }
+                // Transient / timeout / breaker trip / rejection: advance.
+                _ => {
+                    *last_err = e.into_inner().or(last_err.take());
+                    ControlFlow::Continue(())
+                }
+            },
+        }
+    }
+
+    /// Run `op` against members chosen by the `Pick` strategy. `op` receives the
+    /// chosen member id by reference.
+    ///
+    /// A borrowed-`Id` op cannot generally be `Send`-usable from a `Send`-required
+    /// async context (e.g. behind `#[async_trait]`); see [`RouterPolicy::run_owned`]
+    /// for that case.
+    ///
+    /// - A breaker-open member is skipped (its cooldown feeds the park hint).
+    /// - `Ok` → [`Served`] with the member id and how many members were attempted.
+    /// - A transient failure (per `advance_when`), timeout, breaker trip, or
+    ///   rejection advances to the next-best member.
+    /// - A **permanent** operation error fails fast with [`RouterError::Exhausted`].
+    /// - Every member cooling → [`RouterError::AllUnavailable`].
+    pub async fn run<F>(&self, mut op: F) -> Result<Served<Id, T>, RouterError<Id, E>>
+    where
+        F: AsyncFnMut(&Id) -> Result<T, E>,
+    {
+        let (mut healthy, soonest) = self.healthy_members();
         if healthy.is_empty() {
             return Err(RouterError::AllUnavailable {
                 next_available_at: soonest,
@@ -354,44 +421,86 @@ where
             let guard = InFlightGuard::acquire(&target.state);
             let id_ref = &target.id;
             let outcome = target.policy.run(async || op(id_ref).await).await;
-
-            // Meter fold on completion (F2/F9: only the fold decides what ok means).
-            if let Some(meter) = &self.meter {
-                let now = self.core.now();
-                let mut cell = target.state.meter.lock().unwrap();
-                let last = cell.map(|c| c.last_update).unwrap_or(now);
-                let sample = Sample {
-                    latency: now.saturating_duration_since(attempt_start),
-                    at: now,
-                    last_update: last,
-                    in_flight: target.state.in_flight.load(AtomicOrdering::SeqCst),
-                    ok: outcome.is_ok(),
-                };
-                *cell = Some(meter.fold(*cell, &sample));
-            }
-            target.state.pick_count.fetch_add(1, AtomicOrdering::SeqCst); // F11
+            self.record_attempt(target, attempt_start, outcome.is_ok());
             drop(guard); // decrement BEFORE any advance (F5)
 
-            match outcome {
-                Ok(value) => {
-                    return Ok(Served {
-                        value,
-                        target: target.id.clone(),
-                        attempts,
-                    });
-                }
-                Err(e) => match &e {
-                    // Permanent operation error → fail fast, do not burn the pool.
-                    ExecutionError::Operation { source, .. } if !(self.advance_when)(source) => {
-                        return Err(RouterError::Exhausted(
-                            e.into_inner().expect("Operation variant carries a source"),
-                        ));
-                    }
-                    // Transient / timeout / breaker trip / rejection: advance.
-                    _ => {
-                        last_err = e.into_inner().or(last_err);
-                    }
-                },
+            if let ControlFlow::Break(result) =
+                self.after_attempt(target, attempts, outcome, &mut last_err)
+            {
+                return result;
+            }
+            healthy.retain(|&i| i != chosen);
+        }
+
+        match last_err {
+            Some(e) => Err(RouterError::Exhausted(e)),
+            None => Err(RouterError::AllUnavailable {
+                next_available_at: soonest,
+            }),
+        }
+    }
+
+    /// Run `op` against members chosen by the `Pick` strategy, identically to
+    /// [`RouterPolicy::run`] except `op` receives the chosen member id **by
+    /// value** (an owned clone) rather than by reference.
+    ///
+    /// This exists so the returned future is closer to `Send`-usable from a
+    /// `Send`-required async context (e.g. behind `#[async_trait]`, issue
+    /// #7): an async closure over `&Id` is not `Send` for<'a> in general (the
+    /// compiler reports `implementation of Send is not general enough` for
+    /// the borrowed id), whereas one over an owned, `move`d `Id` removes that
+    /// specific obstruction. Behavior is otherwise identical to `run` — same
+    /// selection, breaker-skip + cooldown-hint accumulation, and
+    /// advance/fail-fast classification.
+    ///
+    /// **Known limitation (tracked in issue #7):** eliminating the `&Id`
+    /// capture does not, by itself, make the returned future unconditionally
+    /// `Send`. `ExecutionPolicy::run`'s own internals thread every attempt
+    /// through an `AsyncFnMut(Attempt<'_>) -> ...` — itself a higher-ranked
+    /// (`for<'a>`) closure bound — and composing that with any op-adapting
+    /// closure supplied by a generic caller (this router, in particular)
+    /// still trips the same `Send`-is-not-general-enough compiler limitation,
+    /// now surfacing on `Plan`'s own fields (observed: `&concurrency::CompiledConcurrency`)
+    /// rather than on `&Id`. This reproduces identically for plain `run`,
+    /// `run_with`, and `execute` once their op is wrapped by a second,
+    /// generic closure layer — it is not specific to the router or to `Id`.
+    /// Closing it fully requires `Attempt<'_>` (or the `run_pipeline`
+    /// composition) to stop being higher-ranked, which is out of scope for
+    /// this additive, router-only change.
+    pub async fn run_owned<F>(&self, mut op: F) -> Result<Served<Id, T>, RouterError<Id, E>>
+    where
+        F: AsyncFnMut(Id) -> Result<T, E> + Send,
+    {
+        let (mut healthy, soonest) = self.healthy_members();
+        if healthy.is_empty() {
+            return Err(RouterError::AllUnavailable {
+                next_available_at: soonest,
+            });
+        }
+
+        let mut attempts = 0u32;
+        let mut last_err: Option<E> = None;
+
+        while !healthy.is_empty() {
+            let chosen = self.choose(&healthy)?;
+            let target = &self.targets[chosen];
+            attempts += 1;
+
+            let attempt_start = self.core.now();
+            let guard = InFlightGuard::acquire(&target.state);
+            let id = target.id.clone();
+            let op_ref = &mut op;
+            let outcome = target
+                .policy
+                .run(async move || op_ref(id.clone()).await)
+                .await;
+            self.record_attempt(target, attempt_start, outcome.is_ok());
+            drop(guard); // decrement BEFORE any advance (F5)
+
+            if let ControlFlow::Break(result) =
+                self.after_attempt(target, attempts, outcome, &mut last_err)
+            {
+                return result;
             }
             healthy.retain(|&i| i != chosen);
         }
@@ -475,6 +584,63 @@ mod tests {
         assert_eq!(served.target, "secondary".to_string());
         assert_eq!(served.attempts, 2);
     }
+
+    #[tokio::test]
+    async fn run_owned_serves_first_healthy_with_owned_id() {
+        let clock = ManualClock::new();
+        let router = RouterPolicy::builder()
+            .target(member(&clock, "deepseek"))
+            .target(member(&clock, "glm"))
+            .select(Pick::first_healthy())
+            .advance_when(|e: &u16| *e == 429 || *e >= 500)
+            .build_with(TestCore::new(clock.clone()));
+        let served = router
+            .run_owned(async |id: String| {
+                assert_eq!(id, "deepseek".to_string());
+                Ok::<u32, u16>(7)
+            })
+            .await
+            .expect("served");
+        assert_eq!(served.value, 7);
+        assert_eq!(served.target, "deepseek".to_string());
+        assert_eq!(served.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn run_owned_advances_to_next_member_on_transient() {
+        let clock = ManualClock::new();
+        let router = RouterPolicy::builder()
+            .target(member(&clock, "primary"))
+            .target(member(&clock, "secondary"))
+            .select(Pick::first_healthy())
+            .advance_when(|e: &u16| *e == 429 || *e >= 500)
+            .build_with(TestCore::new(clock.clone()));
+        let served = router
+            .run_owned(async |id: String| {
+                if id == "primary" {
+                    Err::<u32, u16>(503)
+                } else {
+                    Ok(9)
+                }
+            })
+            .await
+            .expect("secondary serves");
+        assert_eq!(served.target, "secondary".to_string());
+        assert_eq!(served.attempts, 2);
+    }
+
+    // NOTE (issue #7): a compile-level `assert_send(router.run_owned(...))`
+    // guard was attempted here but does NOT currently compile — see the
+    // "Known limitation" section on `RouterPolicy::run_owned`'s doc comment
+    // and `.run_owned_report.md` for the full investigation. `run_owned`
+    // does eliminate the `&Id`-specific `Send`-not-general-enough failure
+    // (verified: `run`'s borrowed-id op reproducibly fails with two
+    // independent "not general enough" errors — one on `&Id`/`&String`, one
+    // on `&concurrency::CompiledConcurrency`; `run_owned` fails with only the
+    // latter). The remaining failure is pre-existing inside
+    // `ExecutionPolicy::run`'s `Attempt<'_>`-based composition, reproduces
+    // identically for bare `run`/`run_with`/`execute` once double-wrapped,
+    // and is not fixable from this crate's router-only, additive surface.
 
     #[tokio::test]
     async fn permanent_error_does_not_advance() {
