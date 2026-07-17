@@ -28,7 +28,7 @@ impl FailureClass {
         }
     }
 
-    /// Whether a `FallbackPolicy` should advance to the next target on this class.
+    /// Whether a `RouterPolicy` should advance to the next member on this class.
     pub fn should_advance(self) -> bool {
         matches!(self, Self::Retryable)
     }

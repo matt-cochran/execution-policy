@@ -68,8 +68,6 @@ pub(crate) type ScoreFn<Id> = Arc<dyn for<'a> Fn(&Candidate<'a, Id>) -> f64 + Se
 /// per-algorithm branch is structurally impossible (F8).
 #[derive(Clone)]
 pub struct Pick<Id> {
-    // Evaluated by RouterPolicy's argmin (router deliverable, next cohort).
-    #[allow(dead_code)]
     pub(crate) score: ScoreFn<Id>,
     pub(crate) sample: Option<usize>,
     pub(crate) requires_meter: bool,
@@ -138,8 +136,6 @@ impl<Id> Pick<Id> {
     }
 
     /// Whether the configured sample size is valid (`Some(0)` is not — F10/§15).
-    // Called by RouterPolicy's build validation (router deliverable, next cohort).
-    #[allow(dead_code)]
     pub(crate) fn sample_is_valid(&self) -> bool {
         !matches!(self.sample, Some(0))
     }

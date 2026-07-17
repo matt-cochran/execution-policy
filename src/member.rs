@@ -13,9 +13,7 @@ use crate::meter::PeakEwmaState;
 use crate::policy::ExecutionPolicy;
 
 /// Per-member load/health state shared across every router the member joins.
-// Fields consumed by RouterPolicy's choose() + meter fold (router deliverable, next cohort).
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct MemberState {
     /// Outstanding calls right now (a *signal*, never a cap).
     pub(crate) in_flight: AtomicUsize,
@@ -54,11 +52,7 @@ impl std::error::Error for WeightError {}
 /// same breaker — which is the cross-pool health-sharing mechanism (alongside the
 /// shared `Arc<MemberState>` for load).
 pub struct Member<Id, C, T, E> {
-    // Read by RouterPolicy when registering/serving (router deliverable, next cohort).
-    #[allow(dead_code)]
     pub(crate) id: Id,
-    // Wraps each attempt (router deliverable, next cohort).
-    #[allow(dead_code)]
     pub(crate) policy: Arc<ExecutionPolicy<C, T, E>>,
     pub(crate) weight: f64,
     pub(crate) state: Arc<MemberState>,

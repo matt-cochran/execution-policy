@@ -35,8 +35,6 @@ type FoldFn = Arc<dyn Fn(Option<PeakEwmaState>, &Sample) -> PeakEwmaState + Send
 /// `Candidate::latency()` needs it. Clone-cheap (shares an `Arc`'d fold).
 #[derive(Clone)]
 pub struct Meter {
-    // Read by `fold()`; both are consumed by RouterPolicy (router deliverable, next cohort).
-    #[allow(dead_code)]
     fold: FoldFn,
     /// True for meters that drive a latency-aware score; lets the router require
     /// a meter when such a strategy is selected (see the router's build check).
@@ -92,8 +90,6 @@ impl Meter {
         }
     }
 
-    // Consumed by RouterPolicy on call completion (router deliverable, next cohort).
-    #[allow(dead_code)]
     pub(crate) fn fold(&self, prev: Option<PeakEwmaState>, s: &Sample) -> PeakEwmaState {
         (self.fold)(prev, s)
     }
