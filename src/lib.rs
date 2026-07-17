@@ -36,6 +36,8 @@ pub mod core;
 pub mod error;
 pub mod event;
 pub mod fallback;
+pub mod meter;
+pub mod pick;
 pub mod policy;
 pub mod retry;
 pub mod stall;
@@ -56,6 +58,8 @@ pub use crate::event::Event;
 pub use crate::fallback::{
     FallbackError, FallbackPolicy, FallbackPolicyBuilder, Selection, Served,
 };
+pub use crate::meter::{Meter, Sample};
+pub use crate::pick::{Candidate, Pick};
 pub use crate::policy::ExecutionPolicy;
 pub use crate::retry::{Backoff, Jitter, Retry, RetryBudget};
 pub use crate::stall::{Progress, StallError, stall_timeout};
