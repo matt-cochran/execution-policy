@@ -62,3 +62,32 @@ async fn composed_policy_run_future_is_send() {
         .expect("spawned task joins");
     assert_eq!(outcome.ok(), Some(9));
 }
+
+/// A `RouterPolicy::run_boxed` future is `Send` — a router bridging its op into each
+/// member's `ExecutionPolicy::run` survives `tokio::spawn`. This is the exact generic
+/// op-composition that `run`/`run_owned` cannot make `Send` (issue #7); `run_boxed`'s
+/// concrete `BoxFuture` op erases the generic future type so the composed future is
+/// `Send` on stable Rust. If this regresses, the test stops compiling.
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn router_run_boxed_future_is_send() {
+    use execution_policy::{BoxFuture, Member, Pick, RouterPolicy};
+    let router = RouterPolicy::builder()
+        .target(Member::new(
+            "a".to_string(),
+            ExecutionPolicyBuilder::<i32, ()>::new().build(),
+        ))
+        .select(Pick::first_healthy())
+        .advance_when(|_e: &()| true)
+        .build();
+    let served = tokio::spawn(async move {
+        router
+            .run_boxed(|_id: String| -> BoxFuture<'static, Result<i32, ()>> {
+                Box::pin(async { Ok::<i32, ()>(11) })
+            })
+            .await
+    })
+    .await
+    .expect("spawned task joins");
+    assert_eq!(served.ok().map(|s| s.value), Some(11));
+}

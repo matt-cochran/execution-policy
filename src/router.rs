@@ -453,20 +453,13 @@ where
     /// selection, breaker-skip + cooldown-hint accumulation, and
     /// advance/fail-fast classification.
     ///
-    /// **Known limitation (tracked in issue #7):** eliminating the `&Id`
-    /// capture does not, by itself, make the returned future unconditionally
-    /// `Send`. `ExecutionPolicy::run`'s own internals thread every attempt
-    /// through an `AsyncFnMut(Attempt<'_>) -> ...` — itself a higher-ranked
-    /// (`for<'a>`) closure bound — and composing that with any op-adapting
-    /// closure supplied by a generic caller (this router, in particular)
-    /// still trips the same `Send`-is-not-general-enough compiler limitation,
-    /// now surfacing on `Plan`'s own fields (observed: `&concurrency::CompiledConcurrency`)
-    /// rather than on `&Id`. This reproduces identically for plain `run`,
-    /// `run_with`, and `execute` once their op is wrapped by a second,
-    /// generic closure layer — it is not specific to the router or to `Id`.
-    /// Closing it fully requires `Attempt<'_>` (or the `run_pipeline`
-    /// composition) to stop being higher-ranked, which is out of scope for
-    /// this additive, router-only change.
+    /// Note: `run_owned` takes an ergonomic generic `AsyncFnMut` op, which is ideal
+    /// for non-`Send` callers. Composing a *generic* async op into each member's
+    /// `ExecutionPolicy::run` leaves the returned future non-`Send`-general (`for<'a>`)
+    /// — the "Send not general enough" limitation (issue #7) surfacing on the engine's
+    /// `&Plan` internals. If your caller's future must be `Send` (behind
+    /// `#[async_trait]`, `tokio::spawn`, etc.), use [`run_boxed`](Self::run_boxed),
+    /// whose concrete `BoxFuture` op erases the generic future type and IS `Send`.
     pub async fn run_owned<F>(&self, mut op: F) -> Result<Served<Id, T>, RouterError<Id, E>>
     where
         F: AsyncFnMut(Id) -> Result<T, E> + Send,
@@ -494,6 +487,71 @@ where
                 .policy
                 .run(async move || op_ref(id.clone()).await)
                 .await;
+            self.record_attempt(target, attempt_start, outcome.is_ok());
+            drop(guard); // decrement BEFORE any advance (F5)
+
+            if let ControlFlow::Break(result) =
+                self.after_attempt(target, attempts, outcome, &mut last_err)
+            {
+                return result;
+            }
+            healthy.retain(|&i| i != chosen);
+        }
+
+        match last_err {
+            Some(e) => Err(RouterError::Exhausted(e)),
+            None => Err(RouterError::AllUnavailable {
+                next_available_at: soonest,
+            }),
+        }
+    }
+
+    /// `Send`-usable variant of [`run_owned`](Self::run_owned) for callers whose own
+    /// future must be `Send` (behind `#[async_trait]`, `tokio::spawn`, etc.). The op is
+    /// a plain `Fn(Id)` returning an OWNED, boxed `Send` future
+    /// ([`BoxFuture<'static, _>`](crate::BoxFuture)).
+    ///
+    /// Why this exists: `run`/`run_owned` take a generic async op, and composing that
+    /// generic op into each member's [`ExecutionPolicy::run`] leaves the engine future
+    /// non-`Send`-general (`for<'a>`) — the "Send not general enough" obstruction (issue
+    /// #7) that surfaces on the engine's `&Plan` internals for ANY generic caller, even
+    /// though `ExecutionPolicy::run`'s future is `Send` for a *concrete* op (see
+    /// `tests/send_regression.rs`). Handing each policy a **concrete** `BoxFuture`
+    /// erases the generic future type, so the composed router future is `Send` on stable
+    /// Rust. Behaviour is otherwise identical to `run`/`run_owned`.
+    pub async fn run_boxed<F>(&self, op: F) -> Result<Served<Id, T>, RouterError<Id, E>>
+    where
+        F: Fn(Id) -> crate::core::BoxFuture<'static, Result<T, E>> + Send + Sync + 'static,
+        Id: Send,
+    {
+        let (mut healthy, soonest) = self.healthy_members();
+        if healthy.is_empty() {
+            return Err(RouterError::AllUnavailable {
+                next_available_at: soonest,
+            });
+        }
+
+        // Own the op behind an `Arc` so each per-member closure captures it by VALUE
+        // (a cheap `Arc` clone), never by borrow — a `&op` borrow would re-introduce
+        // the same `for<'a> Send` obstruction, just on the op instead of the engine.
+        let op = Arc::new(op);
+        let mut attempts = 0u32;
+        let mut last_err: Option<E> = None;
+
+        while !healthy.is_empty() {
+            let chosen = self.choose(&healthy)?;
+            let target = &self.targets[chosen];
+            attempts += 1;
+
+            let attempt_start = self.core.now();
+            let guard = InFlightGuard::acquire(&target.state);
+            let id = target.id.clone();
+            let op = Arc::clone(&op);
+            // A CONCRETE `BoxFuture` per attempt (no generic future type for the
+            // engine's `Send for<'a>` inference to choke on), and an OWNED `Arc<F>`
+            // (no `&op` borrow) — together these make the composed router future
+            // `Send` on stable Rust (issue #7).
+            let outcome = target.policy.run(move || (*op)(id.clone())).await;
             self.record_attempt(target, attempt_start, outcome.is_ok());
             drop(guard); // decrement BEFORE any advance (F5)
 
@@ -629,18 +687,14 @@ mod tests {
         assert_eq!(served.attempts, 2);
     }
 
-    // NOTE (issue #7): a compile-level `assert_send(router.run_owned(...))`
-    // guard was attempted here but does NOT currently compile — see the
-    // "Known limitation" section on `RouterPolicy::run_owned`'s doc comment
-    // and `.run_owned_report.md` for the full investigation. `run_owned`
-    // does eliminate the `&Id`-specific `Send`-not-general-enough failure
-    // (verified: `run`'s borrowed-id op reproducibly fails with two
-    // independent "not general enough" errors — one on `&Id`/`&String`, one
-    // on `&concurrency::CompiledConcurrency`; `run_owned` fails with only the
-    // latter). The remaining failure is pre-existing inside
-    // `ExecutionPolicy::run`'s `Attempt<'_>`-based composition, reproduces
-    // identically for bare `run`/`run_with`/`execute` once double-wrapped,
-    // and is not fixable from this crate's router-only, additive surface.
+    // NOTE (issue #7): the `Send`-usability guard lives in
+    // `tests/send_regression.rs::router_run_boxed_future_is_send` — it
+    // `tokio::spawn`s a `RouterPolicy::run_boxed(...)` future, which requires
+    // `Send`. `run_boxed`'s concrete `BoxFuture` op (plus an owned `Arc<F>`, so
+    // no `&op` borrow) erases the generic future type that otherwise trips the
+    // "Send not general enough" HRTB obstruction on the engine's `&Plan`
+    // internals — closing #7 on stable Rust. (`run`/`run_owned` take a generic
+    // async op and are for non-`Send` callers.)
 
     #[tokio::test]
     async fn permanent_error_does_not_advance() {
