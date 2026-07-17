@@ -1,6 +1,6 @@
 # execution-policy 0.0.5 — Load-Balancing Router (design)
 
-**Status:** design, approved to implement
+**Status:** design, FMECA-vetted (iteration 1 — all risks Low), approved to implement
 **Date:** 2026-07-17
 **Scope:** execution-policy crate only. The praxec consumer (capability-driven
 resolution, behavior specs, tagged member pools) is a *separate* spec and is
@@ -97,22 +97,34 @@ Pick::round_robin()               // by_score(|c| c.pick_count() as f64)
 Pick::least_in_flight()           // by_score(|c| c.in_flight() as f64)
 Pick::weighted_least_in_flight()  // by_score(|c| (c.in_flight() as f64 + 1.0) / c.weight())
 Pick::p2c()                       // by_sampled_score(2, |c| c.in_flight() as f64)
-Pick::peak_ewma()                 // by_sampled_score(2, |c| c.latency().as_secs_f64() * (c.in_flight() as f64 + 1.0))
+Pick::peak_ewma()                 // by_sampled_score(2, |c| lat(c) * (c.in_flight() as f64 + 1.0))
+                                  //   where lat(c) = c.latency().expect("requires_meter").as_secs_f64()
+                                  //   — peak_ewma is flagged requires_meter, so build() guarantees Some (§15).
 ```
 
 Rules:
-- **Argmin**, with **deterministic tie-break by ascending `index`** (insertion
-  order). Ties never depend on hashmap iteration order or wall clock.
+- **Argmin via `f64::total_cmp`**, with **deterministic tie-break by ascending
+  `index`** (insertion order). Ties never depend on hashmap iteration order or
+  wall clock.
+- **NaN / non-finite scores fail fast** (F7). Argmin does **not** use
+  `partial_cmp().unwrap()` (panics) and does **not** silently treat NaN as
+  largest. A NaN or infinite score returns `RouterError::Score { id, value }`
+  naming the offending member and value — a score bug surfaces loudly, never as a
+  quiet mis-route.
 - Candidates handed to the closure are **already filtered to breaker-healthy**
   (breaker not `Open`). A score closure therefore *cannot* route to an open
   breaker — poka-yoke. (An empty healthy set short-circuits to
   `RouterError::AllUnavailable` before any score runs.)
-- **Sampling** draws indices from `Core::next_u64` — deterministic under
-  `TestCore`. `by_sampled_score(k, ..)` with `k >= healthy_len` degenerates to
-  scanning all healthy candidates (no wasted RNG, identical result to `by_score`).
-- `Pick` holds only the closure(s) + `k`; it is `Clone` and cheap. Round-robin's
-  cursor is **not** in `Pick` — it is the per-member `pick_count` in shared state
-  (§5), so round-robin composes as a pure score with no special router path.
+- **Sampling is without replacement** (F10): `by_sampled_score(k, ..)` draws `k`
+  **distinct** indices from `Core::next_u64` (deterministic under `TestCore`).
+  `k >= healthy_len` degenerates to scanning all healthy candidates (identical to
+  `by_score`); `k == 0` is rejected at build (§15).
+- `Pick` holds **only** the closure(s) + `k` — it carries **no `StrategyKind`
+  enum or discriminant** (F8). The engine has nothing to `match` on, so a
+  per-algorithm branch is *structurally impossible*: it will not compile because
+  there is no variant to switch over. This is the composability guarantee enforced
+  by the type, not by discipline. Round-robin's cursor is likewise **not** in
+  `Pick` — it is the per-member `pick_count` in shared state (§5).
 
 The builder gains `.select(Pick<Id>)` replacing `.select(Selection)`. Default
 remains `Pick::first_healthy()` (0.0.4 behavior preserved by default).
@@ -131,15 +143,26 @@ impl<'a, Id> Candidate<'a, Id> {
     pub fn id(&self) -> &Id;
     pub fn index(&self) -> usize;      // insertion order — the ordered-failover score & tie-break
     pub fn in_flight(&self) -> usize;  // current outstanding calls (shared, live)
-    pub fn weight(&self) -> f64;       // configured capacity weight (default 1.0)
-    pub fn pick_count(&self) -> u64;   // times chosen — the round-robin score
-    pub fn latency(&self) -> Duration; // current meter reading; Duration::ZERO if no meter
+    pub fn weight(&self) -> f64;       // configured capacity weight (finite, > 0)
+    pub fn pick_count(&self) -> u64;   // GLOBAL times chosen across all pools (§5, F11)
+    pub fn latency(&self) -> Option<Duration>; // meter reading; None if no meter configured
 }
 ```
 
-`weight` is configured on the `Member` handle (`Member::new(id, policy)` is
-weight 1.0; `.weight(w)` overrides). Everything else is derived from shared
-per-member state (§5).
+`weight` is configured on the `Member` handle and is **validated finite and > 0
+at construction** (F1) — `Member::new(id, policy)` is weight 1.0, `.weight(w)`
+rejects non-finite/≤0 with an error naming the id and value. So a score never
+divides by zero or a negative.
+
+`latency()` returns **`Option<Duration>`** (F4), not a silent `Duration::ZERO`:
+a custom latency-aware score must confront `None` explicitly rather than be
+handed a fake "0ms = infinitely fast" reading when no meter is configured. The
+built-in `peak_ewma` strategy cannot reach `None` because it *requires* a meter
+(enforced at build, §15).
+
+`pick_count` and `in_flight` are **global per member** (summed across every pool
+the member belongs to), not per-router — see §5/F11. Everything except `index`
+and `weight` is derived from shared per-member state (§5).
 
 ---
 
@@ -172,6 +195,26 @@ let router_b = RouterPolicy::builder().target(m.clone())./*…*/build();
 // a call in-flight through router_a is visible to router_b's score; a breaker
 // trip via a reads Open via b.
 ```
+
+**Split-brain prevention (F3).** The invariant holds only if the *same* `Arc`'d
+state backs a given id. Two failure surfaces:
+- **Within one router**: registering an id twice (even with the same handle) is a
+  config error — `build()` fail-fasts with `RouterError`/`BuildError`
+  `duplicate member id: {id}`. A member appears at most once per router.
+- **Across routers**: the crate cannot see two routers at once, so it cannot
+  detect a consumer that mistakenly calls `Member::new` twice for one id instead
+  of cloning one handle. This is an explicit **consumer contract**: *hold exactly
+  one canonical `Member` per id and clone it into each pool.* In praxec that
+  canonical registry is owned by the resolution layer (spec #2). (TRIZ — Local
+  Quality: enforce inside the crate's visibility; delegate the cross-router case
+  to the one place that can see all pools.)
+
+**Global load semantics (F11).** Because `in_flight` and `pick_count` are shared
+per member, `round_robin()` / least-loaded selection rotate by a member's **total
+load across all pools**, not per-pool. This is *intended and correct*: a member
+already saturated by pool B should be de-prioritized by pool A. Documented as
+"least-recently-used (global)"; a shared-pool test pins the semantic so it can't
+silently regress.
 
 **Test (acceptance):** two `RouterPolicy` instances sharing one member — a
 concurrent call through router A increments the in-flight the score sees in router
@@ -223,12 +266,20 @@ pub struct Sample {
   sample with a **time-based weight** (`half_life` via `at - last_update`), and
   takes the max of decayed-vs-observed (the "peak" term) so a cold or briefly
   slow member is not instantly forgotten. All times from `Core::now`.
-- The router owns the per-member meter cell (in `MemberState`, §5), reads it into
-  `Candidate::latency()`, and folds a new `Sample` on each call completion.
-- **No meter configured** ⇒ `Candidate::latency()` returns `Duration::ZERO`.
-  Latency-aware scores (`peak_ewma`) then degenerate to a health-only tie, resolved
-  by index — documented, not surprising. (You would not select `peak_ewma` without
-  a meter; a debug-assert warns if you do.)
+- **`peak_ewma` folds only `ok == true` samples** (F2). A fast *failure* (e.g. a
+  100ms 429 rejection) must never make a throttling member read as "fast" and pull
+  *more* traffic — that would route toward exactly the members the balancer should
+  shed. Failures are the **breaker's** domain, not the latency meter's. `Sample.ok`
+  remains exposed so a custom fold can choose its own policy, but the built-in is
+  correct-by-construction here.
+- **Concurrency**: the per-member meter state lives in `MemberState` behind a
+  `Mutex<PeakEwmaState>` (F9), folded on completion (off the hot path); a data race
+  on the shared `f64`+`Instant` is thereby impossible. Reads take the short lock.
+- **No meter configured** ⇒ `Candidate::latency()` is `None` (F4), not a fake zero.
+  A latency-*reading* named strategy (`peak_ewma`) is flagged `requires_meter` and
+  **`build()` hard-errors in all builds** if no meter is set (§15) — never a
+  `debug_assert` that vanishes in release. Load-only strategies never call
+  `latency()` and are unaffected.
 
 The meter is a router-level config (one meter definition applied per member).
 YAGNI: ship exactly one built-in (`peak_ewma`) behind the seam; the closure form
@@ -245,21 +296,27 @@ Per `run` call:
    `cooling_until` for the park hint).
 3. If none healthy ⇒ `RouterError::AllUnavailable { next_available_at: soonest }`.
 4. **`Pick`** selects one healthy candidate (argmin score, or sampled argmin).
-5. **Acquire in-flight guard** on the chosen member (increment; RAII).
+5. **Acquire per-attempt in-flight guard** on the chosen member (increment; RAII).
+   The guard's scope is **this single attempt**, never the whole `run` (F5).
 6. **Run** the user closure against the chosen `Id`, wrapped by that member's
    `ExecutionPolicy` (its own retry/breaker/timeout apply).
-7. On completion: **meter folds** the `Sample`; **guard drops** (decrement);
-   **`pick_count` increments**.
+7. On attempt completion, **in this order**: **meter folds** the `Sample`
+   (ok/latency); **`pick_count` increments**; **the guard drops** (decrement).
+   The decrement therefore happens **before** any advance (step 9), so a
+   failed-over member is *not* still counted as in-flight while the next member is
+   scored — no cumulative inflation across a multi-hop failover (F5).
 8. On success ⇒ `Served { value, target: id, attempts }`.
-9. On a **classified-transient** failure (per `advance_when`) ⇒ mark this member
-   attempted, return to step 2 over the *remaining* eligible members (this is
-   where "focus-in on survivors when throttled" emerges — no special code).
+9. On a **classified-transient** failure (per the **required** `advance_when` —
+   §15, F6) ⇒ mark this member attempted, return to step 2 over the *remaining*
+   eligible members (this is where "focus-in on survivors when throttled" emerges
+   — no special code).
 10. On a **permanent** operation error ⇒ fail fast with `RouterError::Exhausted`,
     never burning the rest of the pool (0.0.4 semantics preserved).
 11. All members attempted-and-failed ⇒ `RouterError::Exhausted(last_err)`.
 
 `deadline` is surfaced (not self-enforced) exactly as in 0.0.4 — the durable
-caller enforces the wall-clock budget at its park/resume points.
+caller enforces the wall-clock budget at its park/resume points. The advance loop
+is bounded (each member is attempted at most once per `run`), so it cannot spin.
 
 Determinism: every time source is `Core::now`; every random draw is
 `Core::next_u64`. `TestCore` makes selection, sampling, meter decay, and breaker
@@ -331,8 +388,14 @@ let served = router.run(async |m: &Mid| call_provider(m).await).await?;
 - `Selection::FirstHealthy` → `Pick::first_healthy()` (default unchanged).
 - `.target(id, policy)` (two args) → `.target(Member)`; `Member::new(id, policy)`
   + `.weight(w)`. Members are `Clone` and shared across routers (§5).
+- **`advance_when` is now required** (F6) — the permissive 0.0.4 default (advance
+  on *every* error) is removed; `build()` errors if it is unset. Callers who
+  genuinely want "advance on all" pass `|_| true` explicitly. This is a deliberate
+  0.0.4 behavior change: burning the whole pool on a deterministic permanent error
+  must be an explicit choice, never a silent default.
 - New public: `Member`, `Pick`, `Candidate`, `Meter`, `Sample`, `.meter`,
-  `.select(Pick)`.
+  `.select(Pick)`; `Candidate::latency()` is `Option<Duration>`; new
+  `RouterError::Score` and `BuildError` cases (§15).
 - Single-target `ExecutionPolicy` and its builder are **untouched**.
 - CHANGELOG entry; minor-version bump to **0.0.5** (greenfield 0.0.x; breaking
   renames are acceptable pre-1.0 with a clean cutover).
@@ -361,30 +424,90 @@ is out of scope here and specified separately.
 
 ## 14. Behavioral assertions (TDD checklist)
 
+Every *strategy* assertion is **discriminating** (F12): it must **fail if the
+strategy is swapped for `first_healthy()`** — a built-in mutation check baked into
+the test — so no assertion can pass tautologically.
+
+Selection & composition:
 1. `first_healthy()` reproduces 0.0.4 fallback behavior exactly (regression).
 2. Healthy-set filter: an `Open`-breaker member is never handed to a score.
 3. Empty healthy set ⇒ `AllUnavailable` with the soonest `cooling_until`.
 4. Argmin ties break by ascending index, deterministically.
-5. `round_robin` distributes evenly by `pick_count` over M healthy members.
-6. `least_in_flight` picks the least-loaded under skewed in-flight.
-7. `weighted_least_in_flight` holds ~weight-proportional share at steady state.
-8. `p2c` is deterministic under a fixed seed; `k>=len` == full-scan LIF.
-9. `peak_ewma` sheds share from a member with rising measured latency.
-10. In-flight guard decrements on success, on `Err`, and on panic (RAII).
-11. In-flight is a signal, never a block (a saturated member still gets scored).
-12. Cross-pool: two routers sharing a member share in-flight + breaker state.
-13. Meter fold is deterministic under `ManualClock`; no meter ⇒ `latency()==0`.
-14. Permanent op error fails fast (`Exhausted`), does not burn remaining members.
-15. `by_score` custom closure selects exactly as specified.
+5. `round_robin`: over `k·M` calls to M equal healthy members, max−min `pick_count`
+   spread ≤ 1.
+6. `least_in_flight`: with skewed in-flight, picks the strictly-lower member.
+7. `weighted_least_in_flight`: weight-2 vs weight-1 holds a 2:1 share within ±15%
+   over ≥ 200 steady-state calls.
+8. `p2c`: deterministic under a fixed seed; two draws are **distinct** indices;
+   `k ≥ len` == full-scan LIF; result is not always index-0 (not degenerate).
+9. `peak_ewma`: a member with rising *successful*-call latency sheds share even
+   while its in-flight is low.
+10. `by_score` custom closure selects exactly as specified (seam is open).
 
-## 15. Risks (FMECA-style, prevent → detect → fail-fast)
+Numeric & config hygiene (poka-yoke, §15):
+11. `Member::weight(w)` rejects `0.0`, negative, and non-finite `w` (F1).
+12. A `by_score` closure returning `NaN`/`inf` ⇒ `RouterError::Score`, not a panic
+    or arbitrary pick (F7).
+13. `build()` fail-fasts on: zero targets; duplicate member id; `by_sampled_score`
+    `k == 0`; unset `advance_when`; a `requires_meter` strategy with no meter (§15).
 
-| # | Failure mode | Effect | Mitigation |
-|---|--------------|--------|------------|
-| R1 | Score closure reads stale in-flight (race) | Mild imbalance | Snapshot is per-pick and monotonic; imbalance self-corrects next pick. Atomics, no torn reads. Accept — balancing is best-effort by nature. |
-| R2 | A custom score routes to an unhealthy member | Wasted attempt on a dead target | **Prevent**: candidates are pre-filtered to healthy; the score cannot see `Open` members. |
-| R3 | `peak_ewma` selected with no meter | Silent all-ties | **Detect**: debug-assert on build; documented `latency()==0` degeneration to index order. |
-| R4 | In-flight leaks on a non-drop path | Member looks permanently loaded, starves | **Prevent**: RAII guard; test asserts decrement on success/Err/panic (assertion 10). |
-| R5 | Two routers key the same member differently | State not shared | **Prevent**: sharing is by `Arc<MemberState>` handle identity + `Id` key; cross-pool test (12) is the gate. |
-| R6 | Sampling RNG non-deterministic in tests | Flaky P2C tests | **Prevent**: draws via `Core::next_u64`; `TestCore` seeded; assertion 8. |
-| R7 | Rename misses a re-export / doctest | Build break for first consumer | **Detect**: `cargo build --all-features` + doctests + CHANGELOG review in the plan's final gate. |
+State, lifecycle & concurrency:
+14. In-flight guard decrements on success, on `Err`, and on panic (RAII).
+15. Failover: a member's in-flight returns to 0 **before** the next member is
+    scored (guard drops pre-advance, F5).
+16. In-flight is a signal, never a block (a saturated member still gets scored).
+17. Cross-pool: two routers sharing a member share in-flight + breaker state (F3).
+18. Duplicate id within one router ⇒ `build()` error (F3).
+19. Global load: a member's `pick_count`/`in_flight` reflects picks from *all*
+    pools it belongs to (F11).
+20. `peak_ewma` does **not** fold `ok == false` samples — a fast failure does not
+    lower measured latency (F2).
+21. Meter fold is deterministic under `ManualClock`; no meter ⇒ `latency() == None`.
+22. Permanent op error fails fast (`Exhausted`), does not burn remaining members.
+
+## 15. Build-time validation (poka-yoke)
+
+`RouterPolicyBuilder::build()` (and `try_build`) **fail fast** on every mis-config
+below, each with an actionable message naming the offending element. None is a
+`debug_assert` — all hold in release.
+
+| Check | Trigger | Rationale (FM) |
+|-------|---------|----------------|
+| ≥ 1 target | zero members registered | an empty router can only ever return `AllUnavailable` — a silent dead router (config error) |
+| unique ids | same id registered twice | split-brain / ambiguous member (F3) |
+| `advance_when` set | not configured | forces explicit transient classification; no "advance on everything" default (F6) |
+| meter present | strategy is `requires_meter` (e.g. `peak_ewma`) and no `.meter(...)` | latency-aware selection with no latency signal is a silent no-op (F4) |
+| `k ≥ 1` | `by_sampled_score(0, ..)` | zero-sample selection is undefined |
+| finite `w > 0` | `Member::weight` (at construction, not build) | prevents inf/NaN/negative scores (F1) |
+
+## 16. FMECA vet record (iteration 1, 2026-07-17)
+
+Vetted with the reliability-engineering methodology (FMECA → poka-yoke →
+prevent/detect/fail-fast → TRIZ-if-trade-off). 12 failure modes across UX,
+runtime, architecture, and delivery; **all reduced to residual Low.** Two TRIZ
+resolutions, both *Local Quality* (segment the property to where it is correct):
+(a) split-brain enforcement inside the crate's single-router visibility, consumer
+registry for the cross-router case (F3); (b) global-per-member load as the
+*correct* shared-pool semantic rather than a bug to hide (F11).
+
+Key hardening applied to this spec vs. the pre-vet draft:
+- Numeric hygiene: `weight > 0` at construction; NaN/inf scores → `RouterError::Score`
+  (total-order argmin, no `unwrap` panic).
+- Silent-degradation removed: `latency() → Option`; `requires_meter` strategies
+  hard-error at build (no `debug_assert` that vanishes in release).
+- Meter correctness: `peak_ewma` folds only successful calls (a fast failure never
+  reads as fast); meter state behind a `Mutex` (no data race).
+- Lifecycle: per-attempt in-flight guard drops **before** failover advance (no
+  cumulative inflation).
+- Fail-fast defaults: `advance_when` required; empty/duplicate/`k==0` rejected at
+  build.
+- Design-integrity: `Pick` carries no discriminant → per-algorithm branching is
+  structurally impossible.
+- Delivery: strategy assertions are discriminating (must fail if swapped for
+  `first_healthy`) with concrete tolerances.
+
+Stop condition met: **all High/Medium risks mitigated to Low in one iteration**
+(no residual High/Medium to justify iteration 2). Systemic check — accuracy: no
+fabricated figures (tolerances are labeled targets for the tests to pin);
+complexity: additions are small fail-fast guards that *remove* silent-failure
+classes, net utility gain; capability: no strategy or seam removed.
