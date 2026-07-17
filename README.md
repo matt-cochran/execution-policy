@@ -98,6 +98,34 @@ let body = policy
     .await?;
 ```
 
+**5. Balance across many targets.** One `RouterPolicy` over N members, each with
+its own policy (and breaker), chosen by a composable `Pick` over health + load.
+Ordered failover is just `Pick::first_healthy()`; a member cloned into several
+routers shares one breaker + load signal.
+
+```rust
+use execution_policy::{ExecutionPolicyBuilder, Member, Pick, Retry, RouterPolicy};
+
+let member = |id: &str| {
+    Member::new(
+        id.to_string(),
+        ExecutionPolicyBuilder::<_, reqwest::Error>::new()
+            .retry(Retry::exponential().max_attempts(2))
+            .build(),
+    )
+};
+
+let router = RouterPolicy::builder()
+    .target(member("primary"))
+    .target(member("secondary").weight(2.0))
+    .select(Pick::weighted_least_in_flight()) // or .p2c() / .round_robin() / .first_healthy()
+    .advance_when(|e: &reqwest::Error| e.is_timeout() || e.is_connect())
+    .build();
+
+let served = router.run(async |id: &String| call_backend(id).await).await?;
+// served.target = which member served; served.attempts = how many were tried.
+```
+
 ## Why it's different
 
 - **Operation factory, not a future.** The closure is re-invoked per attempt, so
