@@ -81,9 +81,18 @@ impl<Id, C, T, E> std::fmt::Debug for Member<Id, C, T, E> {
 impl<Id, C, T, E> Member<Id, C, T, E> {
     /// A new member with weight `1.0` and fresh shared state.
     pub fn new(id: Id, policy: ExecutionPolicy<C, T, E>) -> Self {
+        Self::from_arc(id, Arc::new(policy))
+    }
+
+    /// A new member wrapping an EXISTING `Arc<ExecutionPolicy>` — so its circuit
+    /// breaker is the caller's long-lived, cross-call one (e.g. a per-provider policy
+    /// shared from a registry), not a fresh one. Use this to give a router
+    /// breaker-aware member-skip that persists across calls; `new` (fresh `Arc`) resets
+    /// the breaker every construction. Weight `1.0`, fresh load state.
+    pub fn from_arc(id: Id, policy: Arc<ExecutionPolicy<C, T, E>>) -> Self {
         Self {
             id,
-            policy: Arc::new(policy),
+            policy,
             weight: 1.0,
             state: MemberState::new(),
         }
