@@ -36,6 +36,7 @@ pub mod core;
 pub mod error;
 pub mod event;
 pub mod fallback;
+pub mod member;
 pub mod meter;
 pub mod pick;
 pub mod policy;
@@ -58,6 +59,7 @@ pub use crate::event::Event;
 pub use crate::fallback::{
     FallbackError, FallbackPolicy, FallbackPolicyBuilder, Selection, Served,
 };
+pub use crate::member::{Member, WeightError};
 pub use crate::meter::{Meter, Sample};
 pub use crate::pick::{Candidate, Pick};
 pub use crate::policy::ExecutionPolicy;
