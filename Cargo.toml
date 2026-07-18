@@ -29,8 +29,11 @@ tracing = ["dep:tracing"]
 tokio = { version = "1", features = ["time", "sync"], optional = true }
 tracing = { version = "0.1", optional = true }
 
+# `sync` is needed by the integration tests (e.g. `Notify` in load_balancing.rs)
+# independently of the optional main-crate `tokio` feature, so the CI clippy pass
+# under `--no-default-features --features test-util` still compiles the tests.
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "sync"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 
 [[bench]]
