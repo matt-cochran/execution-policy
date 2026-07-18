@@ -91,3 +91,49 @@ async fn router_run_boxed_future_is_send() {
     .expect("spawned task joins");
     assert_eq!(served.ok().map(|s| s.value), Some(11));
 }
+
+/// The PRECISE issue-#7 failure mode: a `Send` future that BORROWS `&self` across
+/// the `run_boxed` await — an `#[async_trait]` method (here hand-desugared to
+/// `-> Pin<Box<dyn Future + Send + '_>>`). `tokio::spawn` above only proves the
+/// `'static` case; this proves the borrowed-`&self` case that actually broke a
+/// downstream consumer (praxec's `LlmExecutor::execute`). If `run_boxed`'s future
+/// were not `Send` for ALL lifetimes, the `Box<dyn … + Send + '_>` coercion below
+/// fails to compile with "implementation of `Send` is not general enough".
+#[cfg(feature = "tokio")]
+#[tokio::test]
+async fn router_run_boxed_composes_in_send_borrowed_context() {
+    use execution_policy::core::DefaultCore;
+    use execution_policy::{BoxFuture, Member, Pick, RouterPolicy};
+    use std::future::Future;
+    use std::pin::Pin;
+
+    struct Consumer {
+        router: RouterPolicy<String, DefaultCore, i32, ()>,
+    }
+    impl Consumer {
+        // Mirrors what `#[async_trait]` generates: a `Send` future borrowing `&self`.
+        fn drive(&self) -> Pin<Box<dyn Future<Output = Option<i32>> + Send + '_>> {
+            Box::pin(async move {
+                self.router
+                    .run_boxed(|_id: String| -> BoxFuture<'static, Result<i32, ()>> {
+                        Box::pin(async { Ok::<i32, ()>(11) })
+                    })
+                    .await
+                    .ok()
+                    .map(|s| s.value)
+            })
+        }
+    }
+
+    let consumer = Consumer {
+        router: RouterPolicy::builder()
+            .target(Member::new(
+                "a".to_string(),
+                ExecutionPolicyBuilder::<i32, ()>::new().build(),
+            ))
+            .select(Pick::first_healthy())
+            .advance_when(|_e: &()| true)
+            .build(),
+    };
+    assert_eq!(consumer.drive().await, Some(11));
+}

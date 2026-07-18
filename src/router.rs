@@ -547,11 +547,14 @@ where
             let guard = InFlightGuard::acquire(&target.state);
             let id = target.id.clone();
             let op = Arc::clone(&op);
-            // A CONCRETE `BoxFuture` per attempt (no generic future type for the
-            // engine's `Send for<'a>` inference to choke on), and an OWNED `Arc<F>`
-            // (no `&op` borrow) — together these make the composed router future
-            // `Send` on stable Rust (issue #7).
-            let outcome = target.policy.run(move || (*op)(id.clone())).await;
+            // Drive the member through the engine's BOXED op path
+            // ([`ExecutionPolicy::run_boxed`]): a CONCRETE `BoxFuture` per attempt
+            // (no `AsyncFnMut` `for<'a>` future) and an OWNED `Arc<F>` (no `&op`
+            // borrow). Together with the engine's `FnMut(Attempt) -> Fut` boxed
+            // pipeline, this keeps the composed router future `Send` for ALL
+            // lifetimes — so it survives nesting inside a `Send`-required caller
+            // (`#[async_trait]`, `tokio::spawn`) that `run`/`run_owned` cannot (#7).
+            let outcome = target.policy.run_boxed(move || (*op)(id.clone())).await;
             self.record_attempt(target, attempt_start, outcome.is_ok());
             drop(guard); // decrement BEFORE any advance (F5)
 

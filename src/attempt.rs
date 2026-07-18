@@ -1,26 +1,29 @@
 //! Per-attempt metadata handed to operation closures.
 
-use std::marker::PhantomData;
 use std::time::{Duration, Instant};
 
 /// Metadata for the current attempt. `number()` is 1-based.
+///
+/// Intentionally lifetime-free and fully owned (`Copy`). An earlier design carried
+/// a `PhantomData<&'a ()>` "reserved borrow"; it held nothing, but the `Attempt<'a>`
+/// lifetime forced every op-closure bound to be higher-ranked
+/// (`for<'a> …(Attempt<'a>)`), which — together with `AsyncFnMut`'s own HRTB — made
+/// the engine future fail `Send` inference for any caller whose future must be
+/// `Send` (a router behind `#[async_trait]`, `tokio::spawn`, …). Dropping the
+/// phantom lifetime is one half of removing that obstruction (the other is the
+/// engine taking `FnMut(Attempt) -> Fut` instead of `AsyncFnMut(Attempt)`); a real
+/// borrow can be reintroduced deliberately later if ever needed.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
-pub struct Attempt<'a> {
+pub struct Attempt {
     number: u32,
     start: Instant,
     now: Instant,
-    _borrow: PhantomData<&'a ()>,
 }
 
-impl<'a> Attempt<'a> {
+impl Attempt {
     pub(crate) fn new(number: u32, start: Instant, now: Instant) -> Self {
-        Self {
-            number,
-            start,
-            now,
-            _borrow: PhantomData,
-        }
+        Self { number, start, now }
     }
 
     /// 1-based attempt index (first attempt returns 1).

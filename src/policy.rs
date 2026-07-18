@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::attempt::Attempt;
 use crate::builder::ExecutionPolicyBuilder;
 use crate::core::Core;
-use crate::engine::run_pipeline;
+use crate::engine::{run_pipeline, run_pipeline_boxed};
 use crate::error::ExecutionError;
 use crate::plan::Plan;
 
@@ -78,20 +78,37 @@ where
     where
         F: AsyncFnMut() -> Result<T, E>,
     {
-        run_pipeline(
-            &self.core,
-            &self.plan,
-            async move |_attempt: Attempt<'_>| op().await,
-        )
+        run_pipeline(&self.core, &self.plan, async move |_attempt: Attempt| {
+            op().await
+        })
         .await
     }
 
     /// Run an operation that wants attempt metadata.
     pub async fn execute<F>(&self, op: F) -> Result<T, ExecutionError<E>>
     where
-        F: AsyncFnMut(Attempt<'_>) -> Result<T, E>,
+        F: AsyncFnMut(Attempt) -> Result<T, E>,
     {
         run_pipeline(&self.core, &self.plan, op).await
+    }
+
+    /// `Send`-general variant of [`run`](Self::run): the op is a plain
+    /// `FnMut` returning an OWNED, boxed future
+    /// ([`BoxFuture<'static, _>`](crate::core::BoxFuture)) rather than an
+    /// `AsyncFnMut` whose future borrows the closure.
+    ///
+    /// Same pipeline as `run` (retry, timeouts, breaker, concurrency), but because
+    /// the op's future is a single concrete `Send` type — not `AsyncFnMut`'s
+    /// higher-ranked `CallRefFuture<'a>` — the future this method returns is `Send`
+    /// for ALL lifetimes. That is what lets a router compose it inside a caller
+    /// whose own future must be `Send` (behind `#[async_trait]`, `tokio::spawn`),
+    /// which `run`/`execute` cannot (issue #7). The price is one boxed allocation
+    /// per attempt — negligible next to the network/LLM op it wraps.
+    pub async fn run_boxed<F>(&self, mut op: F) -> Result<T, ExecutionError<E>>
+    where
+        F: FnMut() -> crate::core::BoxFuture<'static, Result<T, E>>,
+    {
+        run_pipeline_boxed(&self.core, &self.plan, move |_attempt: Attempt| op()).await
     }
 
     /// Run an operation with injected application state.
@@ -100,11 +117,9 @@ where
         S: Sync + ?Sized,
         F: AsyncFnMut(&S) -> Result<T, E>,
     {
-        run_pipeline(
-            &self.core,
-            &self.plan,
-            async move |_attempt: Attempt<'_>| op(state).await,
-        )
+        run_pipeline(&self.core, &self.plan, async move |_attempt: Attempt| {
+            op(state).await
+        })
         .await
     }
 
@@ -112,9 +127,9 @@ where
     pub async fn execute_with<S, F>(&self, state: &S, mut op: F) -> Result<T, ExecutionError<E>>
     where
         S: Sync + ?Sized,
-        F: AsyncFnMut(&S, Attempt<'_>) -> Result<T, E>,
+        F: AsyncFnMut(&S, Attempt) -> Result<T, E>,
     {
-        run_pipeline(&self.core, &self.plan, async move |attempt: Attempt<'_>| {
+        run_pipeline(&self.core, &self.plan, async move |attempt: Attempt| {
             op(state, attempt).await
         })
         .await
