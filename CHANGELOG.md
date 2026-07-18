@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.0.6] — 2026-07-18
+
+### Added
+- `RouterPolicy::run_owned` / `run_boxed` and `ExecutionPolicy::run_boxed` — a
+  **`Send`-general** execution path whose op returns an OWNED future (a concrete
+  `BoxFuture<'static, _>`) rather than an `AsyncFnMut` whose future borrows the
+  closure. This is what lets a router compose inside a caller whose own future
+  must be `Send` — e.g. a member router driven from an `#[async_trait]` method or
+  a `tokio::spawn`ed task (issue #7). The ergonomic `AsyncFnMut` `run`/`execute`/
+  `run_with`/`execute_with` are unchanged (zero-alloc retry with borrowed state);
+  the boxed path costs one box per attempt.
+- `Member::from_arc` — register a member over an existing `Arc<ExecutionPolicy>`.
+
+### Changed
+- `Attempt` is now lifetime-free (was a `PhantomData<&'a ()>` that reserved
+  nothing). Removing it drops a `for<'a>` from every op-closure bound — one half
+  of making the boxed path `Send`-general; the other half is the new
+  `FnMut(Attempt) -> Fut` boxed engine (`run_pipeline_boxed`/`drive_boxed`), a
+  drift-guarded twin of the `AsyncFnMut` pipeline (identical retry/timeout/breaker
+  semantics; see `boxed_pipeline_matches_asyncfnmut_pipeline`).
+
 ## [0.0.5] — 2026-07-17
 
 ### Changed (breaking, pre-1.0 clean cutover)
