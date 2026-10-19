@@ -1,0 +1,91 @@
+name: CI
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ${{ vars.CI_RUNNER_MODE == 'blacksmith' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+    - run: cargo fmt --all -- --check
+  clippy:
+    name: clippy
+    needs: fmt
+    runs-on: ${{ vars.CI_RUNNER_MODE == 'blacksmith' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    - uses: Swatinem/rust-cache@v2
+    - run: cargo clippy --all-targets --all-features -- -D warnings
+    - run: cargo clippy --all-targets --no-default-features --features test-util -- -D warnings
+  build:
+    name: build (${{ matrix.features }})
+    needs: clippy
+    runs-on: ${{ vars.CI_RUNNER_MODE == 'blacksmith' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: true
+      matrix:
+        features:
+        - --no-default-features
+        - --no-default-features --features tokio
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - run: cargo build ${{ matrix.features }}
+  test:
+    name: test (${{ matrix.features }})
+    needs: clippy
+    runs-on: ${{ vars.CI_RUNNER_MODE == 'blacksmith' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: true
+      matrix:
+        features:
+        - ''
+        - --all-features
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+    - run: cargo build --all-targets ${{ matrix.features }}
+    - run: cargo test ${{ matrix.features }}
+  msrv:
+    name: msrv (1.85)
+    needs: clippy
+    runs-on: ${{ vars.CI_RUNNER_MODE == 'blacksmith' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.85.0
+    - uses: Swatinem/rust-cache@v2
+    - run: cargo build --all-features
+  ci-pass:
+    name: CI passed
+    if: always()
+    needs:
+    - fmt
+    - clippy
+    - build
+    - test
+    - msrv
+    runs-on: ${{ vars.CI_RUNNER_MODE == 'blacksmith' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    steps:
+    - name: Verify all required jobs succeeded
+      if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result,
+        'skipped') }}
+      run: 'echo "One or more required jobs did not succeed:"
+
+        echo "  fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} build=${{ needs.build.result }} test=${{
+        needs.test.result }} msrv=${{ needs.msrv.result }}"
+
+        exit 1
+
+        '

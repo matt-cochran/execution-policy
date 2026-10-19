@@ -1,110 +1,82 @@
+# Build on Blacksmith once for staging; verify retained results on production promotion.
 name: CI
-
 on:
   push:
-    branches: [main]
+    branches:
+    - dev
+    - staging
+    - main
   pull_request:
+    branches:
+    - dev
+    - staging
+    - main
+  workflow_dispatch: null
+  workflow_call:
 
-# Cancel superseded runs on the same ref to avoid wasting build minutes.
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
 concurrency:
-  group: ci-${{ github.ref }}
+  group: retained-ci.yml-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
-
-env:
-  CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
-
-# Pipeline order (fail fast, cheapest first):
-#   fmt  ──▶  clippy  ──▶  { build, test, msrv, docs }
-# A formatting slip stops the run in seconds; a lint failure stops it before any
-# build/test minutes are spent.
 jobs:
-  # 1. Cheapest gate: formatting only, no compilation. Fails in seconds.
-  fmt:
-    name: fmt
-    runs-on: ubuntu-latest
+  resolve:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft != true }}
+    runs-on: ${{ vars.CI_RUNNER_MODE == 'blacksmith' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    outputs:
+      build-required: ${{ steps.resolve.outputs.build-required }}
+      run-id: ${{ steps.resolve.outputs.run-id }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
-  # 2. Lint gate: one clippy compile across feature configs. Runs only if fmt passed.
-  clippy:
-    name: clippy
-    needs: fmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+          persist-credentials: false
+      - id: resolve
+        uses: ./.github/actions/retained-build
         with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo clippy --all-targets --no-default-features --features test-util -- -D warnings
-
-  # 3. Heavy jobs: only after fmt + clippy are green.
-  # Configs WITHOUT test-util build the library only (the suite needs test-util).
-  build:
-    name: build (${{ matrix.features }})
-    needs: clippy
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: true
-      matrix:
-        features:
-          - "--no-default-features"
-          - "--no-default-features --features tokio"
+          mode: resolve
+          runner-mode: ${{ vars.CI_RUNNER_MODE || 'github' }}
+          runner-label: ${{ vars.CI_RUNNER_MODE == 'blacksmith' && 'blacksmith-2vcpu-ubuntu-2404' || 'github' }}
+          workflow: ci.yml
+          token: ${{ github.token }}
+  checks:
+    needs: resolve
+    if: needs.resolve.outputs.build-required == 'true'
+    uses: ./.github/workflows/ci-checks.yml
+    secrets: inherit
+  build-gate:
+    name: Build gate
+    needs: [resolve, checks]
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
+    runs-on: ${{ vars.CI_RUNNER_MODE == 'blacksmith' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build ${{ matrix.features }}
-
-  # Configs WITH test-util run the full suite: unit + integration + doctests
-  # (`cargo test` runs doctests by default, so they need no separate job) and a
-  # bench-target build check.
-  test:
-    name: test (${{ matrix.features }})
-    needs: clippy
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: true
-      matrix:
-        features:
-          - ""
-          - "--all-features"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --all-targets ${{ matrix.features }}
-      - run: cargo test ${{ matrix.features }}
-
-  msrv:
-    name: msrv (1.85)
-    needs: clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --all-features
-
-  # Single aggregation gate. Make THIS the only required status check in branch
-  # protection; it turns green only when every job above succeeded. `if: always()`
-  # ensures it still runs (and fails) when an upstream job fails or is skipped, so
-  # a failure can't slip through as a skipped-but-"passing" required check.
-  ci-pass:
-    name: CI passed
-    if: always()
-    needs: [fmt, clippy, build, test, msrv]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Verify all required jobs succeeded
-        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}
+      - name: Require full checks or verified retained staging results
+        env:
+          RESOLVE_RESULT: ${{ needs.resolve.result }}
+          BUILD_REQUIRED: ${{ needs.resolve.outputs.build-required }}
+          CHECKS_RESULT: ${{ needs.checks.result }}
+          SOURCE_RUN: ${{ needs.resolve.outputs.run-id }}
+        shell: bash
         run: |
-          echo "One or more required jobs did not succeed:"
-          echo "  fmt=${{ needs.fmt.result }} clippy=${{ needs.clippy.result }} build=${{ needs.build.result }} test=${{ needs.test.result }} msrv=${{ needs.msrv.result }}"
-          exit 1
+          set -euo pipefail
+          test "$RESOLVE_RESULT" = success
+          if [ "$BUILD_REQUIRED" = true ]; then
+            test "$CHECKS_RESULT" = success
+          else
+            test "$BUILD_REQUIRED" = false
+            test -n "$SOURCE_RUN"
+            test "$CHECKS_RESULT" = skipped
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        if: needs.resolve.outputs.build-required == 'true'
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/retained-build
+        if: needs.resolve.outputs.build-required == 'true'
+        with:
+          mode: record
+          runner-mode: ${{ vars.CI_RUNNER_MODE || 'github' }}
+          runner-label: ${{ vars.CI_RUNNER_MODE == 'blacksmith' && 'blacksmith-2vcpu-ubuntu-2404' || 'github' }}
+          workflow: ci.yml
+          token: ${{ github.token }}
